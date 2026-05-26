@@ -193,6 +193,7 @@ export const de: typeof en = {
       tavily: "Tavily API-Key",
       perplexity: "Perplexity API-Key",
       exa: "Exa API-Key",
+      ollama: "Ollama API-Key",
     },
     baseUrl: "DeepSeek-Basis-URL",
     baseUrlHint:

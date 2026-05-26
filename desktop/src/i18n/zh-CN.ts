@@ -180,6 +180,7 @@ export const zhCN: typeof en = {
       tavily: "Tavily API key",
       perplexity: "Perplexity API key",
       exa: "Exa API key",
+      ollama: "Ollama API key",
     },
     baseUrl: "DeepSeek base URL",
     baseUrlHint: "走代理时再改。留空 = 官方地址。需重启。",

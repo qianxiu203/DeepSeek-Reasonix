@@ -180,6 +180,7 @@ export const en = {
       tavily: "Tavily API key",
       perplexity: "Perplexity API key",
       exa: "Exa API key",
+      ollama: "Ollama API key",
     },
     baseUrl: "DeepSeek base URL",
     baseUrlHint: "Override only if using a proxy. Empty = official endpoint. Restart required.",
