@@ -1700,6 +1700,7 @@ export async function desktopCommand(opts: DesktopOptions): Promise<void> {
                 event: "Stop",
                 cwd: tab.rootDir,
                 lastAssistantText,
+                last_assistant_message: lastAssistantText,
                 turn: rt.loop.stats.summary().turns,
               },
             });

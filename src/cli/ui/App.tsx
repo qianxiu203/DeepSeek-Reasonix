@@ -3440,7 +3440,8 @@ function AppInner({
             payload: {
               event: "Stop",
               cwd: currentRootDir,
-              lastAssistantText: streamRef.text,
+              lastAssistantText,
+              last_assistant_message: lastAssistantText,
               turn: loop.stats.summary().turns,
             },
           });
