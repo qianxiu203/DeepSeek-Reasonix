@@ -1,10 +1,146 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cc_switch;
 mod rpc;
 
-use rpc::{RpcState, rpc_kill, rpc_send, rpc_spawn};
+use cc_switch::import_cc_switch_mcp;
+use rpc::{rpc_kill, rpc_send, rpc_spawn, RpcState};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::Manager;
+
+const TRAY_MENU_SHOW: &str = "show";
+const TRAY_MENU_QUIT: &str = "quit";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DesktopCloseBehavior {
+    CloseToTray,
+    CloseToQuit,
+}
+
+fn pasted_images_dir() -> PathBuf {
+    std::env::temp_dir().join("reasonix-pasted-images")
+}
+
+fn parse_desktop_close_behavior(value: &serde_json::Value) -> DesktopCloseBehavior {
+    match value
+        .get("desktopCloseBehavior")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("closeToTray") => DesktopCloseBehavior::CloseToTray,
+        _ => DesktopCloseBehavior::CloseToQuit,
+    }
+}
+
+fn config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".reasonix").join("config.json"))
+}
+
+fn desktop_close_behavior() -> DesktopCloseBehavior {
+    let Some(path) = config_path() else {
+        return DesktopCloseBehavior::CloseToQuit;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return DesktopCloseBehavior::CloseToQuit;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return DesktopCloseBehavior::CloseToQuit;
+    };
+    parse_desktop_close_behavior(&value)
+}
+
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn install_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text(TRAY_MENU_SHOW, "Show Window")
+        .separator()
+        .text(TRAY_MENU_QUIT, "Quit Reasonix")
+        .build()?;
+
+    let mut tray = TrayIconBuilder::with_id("main")
+        .tooltip("Reasonix")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_MENU_SHOW => show_main_window(app),
+            TRAY_MENU_QUIT => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => show_main_window(tray.app_handle()),
+            _ => {}
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        tray = tray.icon(icon);
+    }
+
+    tray.build(app)?;
+    Ok(())
+}
+
+/// #892: bundled libwayland in AppImage can ABI-mismatch the host Wayland
+/// compositor → WebKitWebProcess `abort()`s on EGL display creation. Redirect
+/// the child to the host's libwayland via LD_PRELOAD before WebKit forks.
+#[cfg(target_os = "linux")]
+fn linux_webkit_compat() {
+    fn set_default(key: &str, value: &str) {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+
+    // Always-on: DMABUF renderer breaks on a wider set of Mesa stacks than
+    // libwayland bundling does. Cheap to disable, slow path is still fine.
+    set_default("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+
+    let in_appimage = std::env::var_os("APPDIR").is_some();
+    let on_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if !(in_appimage && on_wayland) {
+        return;
+    }
+
+    // Disable accelerated compositing as well — same EGL init path.
+    set_default("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+
+    // Skip /usr/lib/libwayland-client.so.0 — on 64-bit Fedora that path can
+    // resolve to a 32-bit library and the loader prints a wrong-ELF-class
+    // warning instead of preloading.
+    const CANDIDATES: &[&str] = &[
+        "/usr/lib64/libwayland-client.so.0",
+        "/usr/lib/x86_64-linux-gnu/libwayland-client.so.0",
+        "/lib/x86_64-linux-gnu/libwayland-client.so.0",
+    ];
+    let Some(lib) = CANDIDATES.iter().find(|p| Path::new(p).exists()) else {
+        return;
+    };
+    let existing = std::env::var("LD_PRELOAD").unwrap_or_default();
+    let merged = if existing.is_empty() {
+        (*lib).to_string()
+    } else {
+        format!("{lib}:{existing}")
+    };
+    std::env::set_var("LD_PRELOAD", merged);
+}
 
 #[derive(Serialize)]
 struct FileEntry {
@@ -39,7 +175,9 @@ fn walk_dir(dir: &Path, depth: u32, max_depth: u32, out: &mut Vec<FileEntry>) {
         if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
             continue;
         }
-        let Ok(file_type) = entry.file_type() else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path().to_string_lossy().into_owned();
         if file_type.is_dir() {
             out.push(FileEntry {
@@ -85,7 +223,10 @@ fn git_status(root: String) -> Result<Vec<GitStatusEntry>, String> {
         return Err(format!("not a directory: {root}"));
     }
     let mut cmd = Command::new("git");
-    cmd.arg("status").arg("--porcelain").arg("-z").current_dir(root_path);
+    cmd.arg("status")
+        .arg("--porcelain")
+        .arg("-z")
+        .current_dir(root_path);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -134,12 +275,14 @@ fn open_in_editor(command: String, path: String, line: Option<u32>) -> Result<()
     #[cfg(windows)]
     {
         // Spawn through cmd.exe so `.cmd` shims (code.cmd, cursor.cmd) resolve via PATH.
+        // Normalize forward slashes to backslashes — cmd.exe doesn't handle them reliably.
+        let normalized = path.replace('/', "\\");
         cmd = Command::new("cmd");
         cmd.arg("/c").arg(trimmed);
         if let Some(l) = line {
-            cmd.arg("-g").arg(format!("{}:{}", path, l));
+            cmd.arg("-g").arg(format!("{}:{}", normalized, l));
         } else {
-            cmd.arg(&path);
+            cmd.arg(&normalized);
         }
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -154,38 +297,105 @@ fn open_in_editor(command: String, path: String, line: Option<u32>) -> Result<()
             cmd.arg(&path);
         }
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     cmd.spawn().map_err(|e| format!("spawn {trimmed}: {e}"))?;
     Ok(())
 }
 
-fn main() {
-    // #892: WebKitGTK 2.42+ DMABUF renderer SIGABRTs on some Wayland + Mesa
-    // combos (black screen on launch). Disable it before WebKitWebProcess
-    // spawns; users can opt back in by exporting the var themselves.
-    #[cfg(target_os = "linux")]
-    {
-        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
-            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, &content).map_err(|e| format!("write failed: {e}"))
+}
+
+fn sanitize_image_extension(raw: Option<&str>) -> String {
+    let cleaned = raw
+        .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+    let ok = !cleaned.is_empty()
+        && cleaned.len() <= 8
+        && cleaned.chars().all(|c| c.is_ascii_alphanumeric());
+    if ok {
+        cleaned
+    } else {
+        "png".to_string()
+    }
+}
+
+#[tauri::command]
+fn save_clipboard_image(bytes: Vec<u8>, extension: Option<String>) -> Result<String, String> {
+    let ext = sanitize_image_extension(extension.as_deref());
+    let dir = pasted_images_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("clock error: {e}"))?
+        .as_millis();
+    let path = dir.join(format!("reasonix-pasted-{ts}.{ext}"));
+    std::fs::write(&path, bytes).map_err(|e| format!("write failed: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn purge_old_pasted_images(max_age: Duration) {
+    let dir = pasted_images_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let cutoff = SystemTime::now().checked_sub(max_age);
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if cutoff.is_some_and(|t| modified < t) {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+fn main() {
+    #[cfg(target_os = "linux")]
+    linux_webkit_compat();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if desktop_close_behavior() == DesktopCloseBehavior::CloseToTray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .manage(RpcState::default())
         .invoke_handler(tauri::generate_handler![
             rpc_spawn,
             rpc_send,
             rpc_kill,
+            import_cc_switch_mcp,
             open_in_editor,
             list_workspace_tree,
-            git_status
+            git_status,
+            write_text_file,
+            save_clipboard_image
         ])
         .setup(|app| {
-            use tauri::Manager;
+            std::thread::spawn(|| purge_old_pasted_images(Duration::from_secs(24 * 60 * 60)));
+            install_tray(app)?;
             if let Some(w) = app.get_webview_window("main") {
                 // HiDPI fit: the JSON config asks for 1024x720 logical px.
                 // On Windows laptops at 200% scale (1920x1080 → 960x540
@@ -217,14 +427,77 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("tauri build failed")
-        .run(|app, event| {
+        .run(|app, event| match event {
             // Tauri 2 normally exits the process via Exit; managed-state drops
             // don't always run. ExitRequested fires before that, so we kill the
             // Node child here too — belt-and-braces vs the Drop on RpcHandle.
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                use tauri::Manager;
+            tauri::RunEvent::ExitRequested { .. } => {
                 let state = app.state::<RpcState>();
                 let _ = rpc::rpc_kill(state);
             }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => show_main_window(app),
+            _ => {}
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_desktop_close_behavior, sanitize_image_extension, DesktopCloseBehavior};
+    use serde_json::json;
+
+    #[test]
+    fn accepts_alphanumeric_extensions() {
+        assert_eq!(sanitize_image_extension(Some("png")), "png");
+        assert_eq!(sanitize_image_extension(Some("JPG")), "jpg");
+        assert_eq!(sanitize_image_extension(Some(".webp")), "webp");
+        assert_eq!(sanitize_image_extension(Some("svg")), "svg");
+    }
+
+    #[test]
+    fn falls_back_when_missing_or_invalid() {
+        assert_eq!(sanitize_image_extension(None), "png");
+        assert_eq!(sanitize_image_extension(Some("")), "png");
+        assert_eq!(sanitize_image_extension(Some("   ")), "png");
+    }
+
+    #[test]
+    fn rejects_path_separators_and_traversal() {
+        assert_eq!(sanitize_image_extension(Some("png/../../foo")), "png");
+        assert_eq!(sanitize_image_extension(Some("png\\foo")), "png");
+        assert_eq!(sanitize_image_extension(Some("../bin")), "png");
+        assert_eq!(sanitize_image_extension(Some("p.n.g")), "png");
+    }
+
+    #[test]
+    fn rejects_overlong_extensions() {
+        assert_eq!(sanitize_image_extension(Some("verylongext")), "png");
+    }
+
+    #[test]
+    fn desktop_close_behavior_defaults_to_quit() {
+        assert_eq!(
+            parse_desktop_close_behavior(&json!({})),
+            DesktopCloseBehavior::CloseToQuit
+        );
+    }
+
+    #[test]
+    fn desktop_close_behavior_accepts_tray_mode() {
+        assert_eq!(
+            parse_desktop_close_behavior(&json!({ "desktopCloseBehavior": "closeToTray" })),
+            DesktopCloseBehavior::CloseToTray
+        );
+    }
+
+    #[test]
+    fn desktop_close_behavior_accepts_quit_mode() {
+        assert_eq!(
+            parse_desktop_close_behavior(&json!({ "desktopCloseBehavior": "closeToQuit" })),
+            DesktopCloseBehavior::CloseToQuit
+        );
+    }
 }

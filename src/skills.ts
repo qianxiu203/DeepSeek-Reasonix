@@ -1,9 +1,19 @@
 /** Project scope wins over global. Only names+descriptions enter the prefix; bodies load lazily into the append-only log. */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  constants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { accessSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parseFrontmatter } from "./frontmatter.js";
+import { t } from "./i18n/index.js";
 import { NEGATIVE_CLAIM_RULE, TUI_FORMATTING_RULES } from "./prompt-fragments.js";
 
 export const SKILLS_DIRNAME = "skills";
@@ -13,7 +23,9 @@ export const SKILLS_INDEX_MAX_CHARS = 4000;
 /** Skill identifier shape — alnum + `_` + `-` + interior `.`, 1-64 chars. */
 const VALID_SKILL_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 
-export type SkillScope = "project" | "global" | "builtin";
+export type SkillScope = "project" | "custom" | "global" | "builtin";
+
+export type SkillPathStatus = "ok" | "missing" | "not-directory" | "unreadable";
 
 /** inline = body enters parent log; subagent = isolated child loop, only final answer returns. */
 export type SkillRunAs = "inline" | "subagent";
@@ -34,8 +46,13 @@ export interface Skill {
   runAs: SkillRunAs;
   /** Subagent model override; only meaningful when `runAs === "subagent"`. */
   model?: string;
-  /** Subagent tool-call budget; only meaningful when `runAs === "subagent"`. Clamped to [1, 32]. */
-  maxToolIters?: number;
+}
+
+export interface SkillRoot {
+  dir: string;
+  scope: Exclude<SkillScope, "builtin">;
+  status: SkillPathStatus;
+  priority: number;
 }
 
 export interface SkillStoreOptions {
@@ -43,8 +60,11 @@ export interface SkillStoreOptions {
   homeDir?: string;
   /** Required for project-scope skills; omit to read only the global scope. */
   projectRoot?: string;
+  customSkillPaths?: readonly string[];
   /** Suppress bundled built-ins — for tests asserting exact list contents. */
   disableBuiltins?: boolean;
+  /** Per-skill model override applied to `runAs: subagent` skills (overrides frontmatter `model:`). */
+  subagentModels?: Record<string, "flash" | "pro">;
 }
 
 /** Reject skill files that would silently disappear from the prefix index — `description:` is what `applySkillsIndex` keys on. */
@@ -73,23 +93,27 @@ function parseAllowedTools(raw: string | undefined): readonly string[] | undefin
   return names.length > 0 ? Object.freeze(names) : undefined;
 }
 
-/** `max-iters` is checkpoint cadence, not a budget — work continues across pauses via resume_session. No upper bound; values below 1 fall back to the subagent default. */
-function parseMaxToolIters(raw: string | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  const n = Number.parseInt(raw.trim(), 10);
-  if (!Number.isFinite(n) || n < 1) return undefined;
-  return n;
+/** flash/pro preset → concrete deepseek model id. Kept local so this file doesn't import the CLI preset bundle. */
+function subagentModelForPreset(preset: "flash" | "pro"): string {
+  return preset === "pro" ? "deepseek-v4-pro" : "deepseek-v4-flash";
 }
 
 export class SkillStore {
   private readonly homeDir: string;
   private readonly projectRoot: string | undefined;
+  private readonly customSkillPaths: readonly string[];
   private readonly disableBuiltins: boolean;
+  private readonly subagentModels: Record<string, "flash" | "pro">;
 
   constructor(opts: SkillStoreOptions = {}) {
     this.homeDir = opts.homeDir ?? homedir();
     this.projectRoot = opts.projectRoot ? resolve(opts.projectRoot) : undefined;
+    const baseDir = this.projectRoot ?? process.cwd();
+    this.customSkillPaths = dedupePaths(
+      opts.customSkillPaths?.map((p) => resolveCustomSkillPath(p, baseDir, this.homeDir)) ?? [],
+    );
     this.disableBuiltins = opts.disableBuiltins === true;
+    this.subagentModels = opts.subagentModels ?? {};
   }
 
   /** True iff this store was configured with a project root. */
@@ -97,24 +121,42 @@ export class SkillStore {
     return this.projectRoot !== undefined;
   }
 
-  /** Project scope first so per-repo skill overrides a global with the same name. */
-  roots(): Array<{ dir: string; scope: SkillScope }> {
-    const out: Array<{ dir: string; scope: SkillScope }> = [];
+  /** Project scope first so per-repo skill overrides custom/global entries with the same name. */
+  roots(): SkillRoot[] {
+    const out: Array<{ dir: string; scope: Exclude<SkillScope, "builtin"> }> = [];
     if (this.projectRoot) {
       out.push({
         dir: join(this.projectRoot, ".reasonix", SKILLS_DIRNAME),
         scope: "project",
       });
+      // #870: pick up `.agents/skills` automatically — common convention shared
+      // by skills.sh-style tooling, no config required.
+      out.push({
+        dir: join(this.projectRoot, ".agents", SKILLS_DIRNAME),
+        scope: "project",
+      });
+      // Claude Code compatibility — a user's `.claude/skills/` folder works as-is.
+      out.push({
+        dir: join(this.projectRoot, ".claude", SKILLS_DIRNAME),
+        scope: "project",
+      });
     }
+    for (const dir of this.customSkillPaths) out.push({ dir, scope: "custom" });
     out.push({ dir: join(this.homeDir, ".reasonix", SKILLS_DIRNAME), scope: "global" });
-    return out;
+    out.push({ dir: join(this.homeDir, ".agents", SKILLS_DIRNAME), scope: "global" });
+    out.push({ dir: join(this.homeDir, ".claude", SKILLS_DIRNAME), scope: "global" });
+    return out.map((root, priority) => ({ ...root, priority, status: skillPathStatus(root.dir) }));
   }
 
-  /** Higher-priority root wins on collision (project > global > builtin); sorted for stable prefix hash. */
+  customRoots(): SkillRoot[] {
+    return this.roots().filter((root) => root.scope === "custom");
+  }
+
+  /** Higher-priority root wins on collision (project > custom > global > builtin); sorted for stable prefix hash. */
   list(): Skill[] {
     const byName = new Map<string, Skill>();
-    for (const { dir, scope } of this.roots()) {
-      if (!existsSync(dir)) continue;
+    for (const { dir, scope, status } of this.roots()) {
+      if (status !== "ok") continue;
       let entries: import("node:fs").Dirent[];
       try {
         entries = readdirSync(dir, { withFileTypes: true });
@@ -133,7 +175,17 @@ export class SkillStore {
         if (!byName.has(skill.name)) byName.set(skill.name, skill);
       }
     }
-    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+    return [...byName.values()]
+      .map((s) => this.applyModelOverride(s))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Apply `subagentModels` config override on top of frontmatter `model:`. Inline skills are unaffected. */
+  private applyModelOverride(skill: Skill): Skill {
+    if (skill.runAs !== "subagent") return skill;
+    const override = this.subagentModels[skill.name];
+    if (!override) return skill;
+    return { ...skill, model: subagentModelForPreset(override) };
   }
 
   /** Scaffold a new skill stub at the chosen scope. Refuses to overwrite. */
@@ -177,8 +229,8 @@ export class SkillStore {
   /** Resolve one skill by name. Returns `null` if not found or malformed. */
   read(name: string): Skill | null {
     if (!isValidSkillName(name)) return null;
-    for (const { dir, scope } of this.roots()) {
-      if (!existsSync(dir)) continue;
+    for (const { dir, scope, status } of this.roots()) {
+      if (status !== "ok") continue;
       const dirCandidate = join(dir, name, SKILL_FILE);
       if (existsSync(dirCandidate) && statSync(dirCandidate).isFile()) {
         return this.parse(dirCandidate, name, scope);
@@ -197,18 +249,42 @@ export class SkillStore {
   }
 
   private readEntry(dir: string, scope: SkillScope, entry: import("node:fs").Dirent): Skill | null {
-    if (entry.isDirectory()) {
+    const isDir =
+      entry.isDirectory() || (entry.isSymbolicLink() && this.isSymlinkDirectory(dir, entry.name));
+    // Symlinked flat `<name>.md` files: `entry.isFile()` returns false for symlinks.
+    // Reuse the same `statSync` pattern as `isSymlinkDirectory` (#2104).
+    const isFile =
+      entry.isFile() || (entry.isSymbolicLink() && !isDir && this.isSymlinkFile(dir, entry.name));
+    if (isDir) {
       if (!isValidSkillName(entry.name)) return null;
       const file = join(dir, entry.name, SKILL_FILE);
       if (!existsSync(file)) return null;
       return this.parse(file, entry.name, scope);
     }
-    if (entry.isFile() && entry.name.endsWith(".md")) {
+    if (isFile && entry.name.endsWith(".md")) {
       const stem = entry.name.slice(0, -3);
       if (!isValidSkillName(stem)) return null;
       return this.parse(join(dir, entry.name), stem, scope);
     }
     return null;
+  }
+
+  /** Check if a symlink points to a directory. Returns false for broken symlinks. */
+  private isSymlinkDirectory(parentDir: string, name: string): boolean {
+    try {
+      return statSync(join(parentDir, name)).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  /** Check if a symlink points to a file. Returns false for broken symlinks. */
+  private isSymlinkFile(parentDir: string, name: string): boolean {
+    try {
+      return statSync(join(parentDir, name)).isFile();
+    } catch {
+      return false;
+    }
   }
 
   private parse(path: string, stem: string, scope: SkillScope): Skill | null {
@@ -220,23 +296,104 @@ export class SkillStore {
     }
     const { data, body } = parseFrontmatter(raw);
     const name = data.name && isValidSkillName(data.name) ? data.name : stem;
+    const description = (data.description ?? "").trim();
+    // Surface the silent-pin failure mode at parse time. Builtins always have
+    // a description so user-authored files are the only ones that hit this.
+    if (!description) {
+      console.warn(
+        `[skills] "${name}" at ${path} has no description: — it will be loaded but won't appear in the skills index.`,
+      );
+    }
     return {
       name,
-      description: (data.description ?? "").trim(),
-      body: body.trim(),
+      description,
+      body: loadBodyWithReferences(path, body.trim()),
       scope,
       path,
       allowedTools: parseAllowedTools(data["allowed-tools"]),
-      runAs: parseRunAs(data.runAs),
+      runAs: parseRunAs(data.runAs, data.context, data.agent),
       model: data.model?.startsWith("deepseek-") ? data.model : undefined,
-      maxToolIters: parseMaxToolIters(data["max-iters"]),
     };
   }
 }
 
-/** Unknown values default to the safe (non-spawning) `inline` mode. */
-function parseRunAs(raw: string | undefined): SkillRunAs {
-  return raw?.trim() === "subagent" ? "subagent" : "inline";
+/** Append Anthropic Skills `references/` files to the body (#2214) so depth material
+ *  is available without on-demand wikilink resolution. Only dir-layout skills
+ *  (SKILL.md inside a named folder) can have a sibling `references/` directory. */
+function loadBodyWithReferences(skillFilePath: string, body: string): string {
+  if (!skillFilePath.endsWith(SKILL_FILE)) return body;
+  const refsDir = join(dirname(skillFilePath), "references");
+  if (!existsSync(refsDir)) return body;
+  let entries: string[];
+  try {
+    entries = readdirSync(refsDir)
+      .filter((f) => f.endsWith(".md"))
+      .sort();
+  } catch {
+    return body;
+  }
+  if (entries.length === 0) return body;
+  const parts: string[] = [body];
+  for (const entry of entries) {
+    const slug = entry.slice(0, -3); // strip .md
+    let content: string;
+    try {
+      content = readFileSync(join(refsDir, entry), "utf8").trim();
+    } catch {
+      continue;
+    }
+    if (content) parts.push(`\n\n## Reference: ${slug}\n\n${content}`);
+  }
+  return parts.join("");
+}
+
+function dedupePaths(paths: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const path of paths) {
+    const key = process.platform === "win32" ? path.toLowerCase() : path;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(path);
+  }
+  return out;
+}
+
+function resolveCustomSkillPath(path: string, baseDir: string, homeDir: string): string {
+  const trimmed = path.trim();
+  const expanded =
+    trimmed === "~"
+      ? homeDir
+      : trimmed.startsWith("~/") || trimmed.startsWith("~\\")
+        ? join(homeDir, trimmed.slice(2))
+        : trimmed;
+  return resolve(isAbsolute(expanded) ? expanded : join(baseDir, expanded));
+}
+
+export function skillPathStatus(dir: string): SkillPathStatus {
+  try {
+    const stat = statSync(dir);
+    if (!stat.isDirectory()) return "not-directory";
+    accessSync(dir, constants.R_OK);
+    return "ok";
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return "missing";
+    return "unreadable";
+  }
+}
+
+/** Unknown values default to the safe (non-spawning) `inline` mode. Claude SKILL.md
+ *  uses `context: fork` or a non-empty `agent:` field for the same intent. */
+function parseRunAs(
+  raw: string | undefined,
+  context: string | undefined,
+  agent: string | undefined,
+): SkillRunAs {
+  if (raw?.trim() === "subagent") return "subagent";
+  if (context?.trim().toLowerCase() === "fork") return "subagent";
+  if (agent?.trim()) return "subagent";
+  return "inline";
 }
 
 /** Stub markdown for `/skill new` — minimal frontmatter + scaffolding the user fills in. */
@@ -254,13 +411,22 @@ Tips:
 - Reference tools by name (run_command, edit_file, search_content, ...)
 - Add \`runAs: subagent\` to frontmatter to spawn an isolated subagent loop
 - Add \`allowed-tools: read_file, search_content\` to scope a subagent's tools
-- Add \`max-iters: N\` to change the subagent's pause cadence (default 16). This isn't a budget — the parent resumes on pause, so N is how often the parent gets a checkpoint, not how much total work the subagent gets.
 `;
 }
 
+export function builtinSkillDescription(name: string): string {
+  const key = name === "security-review" ? "securityReview" : name;
+  return t(`builtinSkills.${key}`);
+}
+
+function skillDescription(s: Pick<Skill, "name" | "description" | "scope">): string {
+  if (s.scope !== "builtin") return s.description;
+  return builtinSkillDescription(s.name);
+}
+
 /** Subagent tag goes AFTER the name in brackets — leading-marker tags get copied into `name` arg verbatim. */
-function skillIndexLine(s: Pick<Skill, "name" | "description" | "runAs">): string {
-  const safeDesc = s.description.replace(/\n/g, " ").trim();
+function skillIndexLine(s: Pick<Skill, "name" | "description" | "runAs" | "scope">): string {
+  const safeDesc = skillDescription(s).replace(/\n/g, " ").trim();
   const tag = s.runAs === "subagent" ? " [🧬 subagent]" : "";
   const max = 130 - s.name.length - tag.length;
   const clipped = safeDesc.length > max ? `${safeDesc.slice(0, Math.max(1, max - 1))}…` : safeDesc;
@@ -447,6 +613,47 @@ Don't:
 
 Lead each turn with a one-line status: "▸ running \`npm test\` ..." → "▸ 2 failures in tests/foo.test.ts — first is …" → so the user always knows where you are without scrolling tool output.`;
 
+const BUILTIN_QQ_BODY = `Help the user configure or troubleshoot the built-in QQ channel in Reasonix. This skill is INLINED on purpose — stay in the parent loop and keep the guidance short.
+
+What this skill is for:
+- QQ first-time setup
+- QQ common troubleshooting
+- CLI and desktop paths
+
+Key facts:
+- QQ is a remote channel attached to an existing Reasonix session, not a separate mode.
+- On desktop, QQ follows the current active tab.
+- After desktop QQ runtime landed, inbound QQ messages should appear in the local transcript and replies should route back to QQ.
+- \`未绑定\` / \`unbound\` is an access-control state, not a transport failure by itself.
+
+Safety boundary:
+- Use this reminder when needed: "⚠️ 安全提醒：App Secret 是敏感凭据，不要把它作为对话内容发给模型。只有在 QQ 连接提示出现后，才在该输入步骤里填写；如果刚刚已经发过，建议立刻去 QQ 开放平台重置。"
+- If credentials are needed, tell the user to enter them only in:
+  - the CLI \`/qq connect\` prompt, or
+  - desktop \`Settings -> General -> QQ Channel -> Configure\`.
+- You cannot apply for a QQ Bot, log into the QQ Open Platform, or inspect the user's platform console for them.
+- If the user pastes a secret into chat, tell them to rotate it and continue without repeating it back.
+
+How to answer:
+- If the user only mentions "qq" or uses another vague reference, first confirm whether they want QQ channel setup, connection help, or troubleshooting before giving steps.
+- First figure out whether they are on CLI or desktop.
+- Then figure out whether this is first-time setup or troubleshooting.
+- Prefer the shortest next action, not a long manual.
+- Use one concrete verification step at a time.
+- Ask only the minimum follow-up needed to unblock them.
+
+Do not:
+- dump long architecture explanations unless asked
+- broaden into Feishu / Discord / cc-connect unless explicitly asked
+
+Docs are the fallback, not the main path:
+- QQ Bot apply page: https://q.qq.com/qqbot/openclaw/login.html
+- Official config guide (zh): https://esengine.github.io/DeepSeek-Reasonix/configuration.html?lang=zh
+- QQ guide (zh): https://github.com/esengine/DeepSeek-Reasonix/blob/main/docs/qq-connect.zh-CN.md
+- Non-official fallback mirror for the QQ guide: https://cdn.jsdelivr.net/gh/esengine/DeepSeek-Reasonix@main/docs/qq-connect.zh-CN.md
+
+Use this skill when the user needs help getting QQ working.`;
+
 const BUILTIN_SKILLS: readonly Skill[] = Object.freeze([
   Object.freeze<Skill>({
     name: "explore",
@@ -489,6 +696,15 @@ const BUILTIN_SKILLS: readonly Skill[] = Object.freeze([
     description:
       "Run the project's test suite, diagnose failures, propose SEARCH/REPLACE fixes, re-run until green (or stop after 2 fix attempts on the same failure). Inlined — runs in the parent loop so you see the edit blocks and can /apply them. Detects npm/pnpm/yarn/pytest/go/cargo.",
     body: BUILTIN_TEST_BODY,
+    scope: "builtin",
+    path: "(builtin)",
+    runAs: "inline",
+  }),
+  Object.freeze<Skill>({
+    name: "qq",
+    description:
+      "Guide QQ channel setup and troubleshooting for CLI or desktop. Best for: first-time setup, QQ connection failures, desktop QQ not replying, App ID / App Secret / QQ environment questions, and current-session routing behavior. Inlined — use when the user clearly needs help configuring or fixing the QQ channel.",
+    body: BUILTIN_QQ_BODY,
     scope: "builtin",
     path: "(builtin)",
     runAs: "inline",

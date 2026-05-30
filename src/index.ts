@@ -41,6 +41,7 @@ export type {
 } from "./at-mentions.js";
 export type {
   CacheFirstLoopOptions,
+  LoopAbortOptions,
   LoopEvent,
   EventRole,
   ReconfigurableOptions,
@@ -98,9 +99,22 @@ export type { TodoItem, TodoStatus, TodoToolOptions } from "./tools/todo.js";
 export { forkRegistryExcluding, registerSubagentTool } from "./tools/subagent.js";
 export type {
   SubagentEvent,
+  SubagentResult,
   SubagentSink,
   SubagentToolOptions,
 } from "./tools/subagent.js";
+export {
+  DEFAULT_SPAWN_STORM_THRESHOLD,
+  SubagentTelemetry,
+  computeSpawnDistillation,
+  countSpawnStorms,
+  summarizeSubagentSession,
+} from "./telemetry/subagent-distillation.js";
+export type {
+  SpawnDistillation,
+  SubagentResultLike,
+  SubagentSessionSummary,
+} from "./telemetry/subagent-distillation.js";
 export {
   NeedsConfirmationError,
   detectShellOperator,
@@ -119,7 +133,7 @@ export type { RunCommandResult, ShellToolsOptions } from "./tools/shell.js";
 export {
   formatSearchResults,
   htmlToText,
-  parseMojeekResults,
+  parseBingResults,
   parseSearxngHtmlResults,
   registerWebTools,
   webFetch,
@@ -280,7 +294,12 @@ export {
   isPlausibleKey,
   loadApiKey,
   loadBaseUrl,
+  loadBaiduApiKey,
   loadMetasoApiKey,
+  loadPerplexityApiKey,
+  loadExaApiKey,
+  loadOllamaApiKey,
+  loadBraveApiKey,
   readConfig,
   redactKey,
   saveApiKey,

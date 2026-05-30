@@ -74,6 +74,45 @@ describe("run_skill tool", () => {
     expect(out).toContain("Run pipeline");
   });
 
+  it("returns a custom path skill when customSkillPaths is passed", async () => {
+    const custom = mkdtempSync(join(tmpdir(), "reasonix-skilltool-custom-"));
+    try {
+      const dir = join(custom, "custom-run");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "SKILL.md"),
+        "---\nname: custom-run\ndescription: Custom run\n---\n\nCustom body\n",
+        "utf8",
+      );
+      const reg = new ToolRegistry();
+      registerSkillTools(reg, { homeDir: home, customSkillPaths: [custom], disableBuiltins: true });
+      const out = await reg.dispatch("run_skill", { name: "custom-run" });
+      expect(out).toContain("scope: custom");
+      expect(out).toContain("Custom body");
+    } finally {
+      rmSync(custom, { recursive: true, force: true });
+    }
+  });
+
+  it("unknown skill available list includes custom skills", async () => {
+    const custom = mkdtempSync(join(tmpdir(), "reasonix-skilltool-custom-"));
+    try {
+      const dir = join(custom, "custom-known");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        join(dir, "SKILL.md"),
+        "---\nname: custom-known\ndescription: Custom known\n---\n\nbody\n",
+        "utf8",
+      );
+      const reg = new ToolRegistry();
+      registerSkillTools(reg, { homeDir: home, customSkillPaths: [custom], disableBuiltins: true });
+      const out = await reg.dispatch("run_skill", { name: "missing" });
+      expect(JSON.parse(out).available).toContain("custom-known");
+    } finally {
+      rmSync(custom, { recursive: true, force: true });
+    }
+  });
+
   it("appends a forwarded 'Arguments:' line when provided", async () => {
     writeSkill(home, "greet", "Greet someone", "Say hello to the name in args.");
     const reg = new ToolRegistry();
@@ -350,7 +389,7 @@ describe("install_skill tool", () => {
     expect(calls[0]?.path).toContain(projectRoot);
   });
 
-  it("writes subagent frontmatter (runAs/model/max-iters/allowed-tools) when runAs=subagent", async () => {
+  it("writes subagent frontmatter (runAs/model/allowed-tools) when runAs=subagent", async () => {
     const reg = new ToolRegistry();
     registerSkillTools(reg, { homeDir: home, projectRoot, disableBuiltins: true });
     const out = await reg.dispatch("install_skill", {
@@ -359,7 +398,6 @@ describe("install_skill tool", () => {
       body: "You are a research subagent. Investigate and answer.",
       runAs: "subagent",
       model: "deepseek-chat",
-      maxToolIters: 24,
       allowedTools: ["read_file", "search_content"],
     });
     const parsed = JSON.parse(out);
@@ -367,14 +405,12 @@ describe("install_skill tool", () => {
     const raw = readFileSync(parsed.path, "utf8");
     expect(raw).toContain("runAs: subagent");
     expect(raw).toContain("model: deepseek-chat");
-    expect(raw).toContain("max-iters: 24");
     expect(raw).toContain("allowed-tools: read_file, search_content");
 
     const store = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true });
     const skill = store.read("deep-research");
     expect(skill?.runAs).toBe("subagent");
     expect(skill?.model).toBe("deepseek-chat");
-    expect(skill?.maxToolIters).toBe(24);
     expect(skill?.allowedTools).toEqual(["read_file", "search_content"]);
   });
 
@@ -386,13 +422,11 @@ describe("install_skill tool", () => {
       description: "inline skill",
       body: "do the thing",
       model: "deepseek-chat",
-      maxToolIters: 42,
       allowedTools: ["read_file"],
     });
     const raw = readFileSync(JSON.parse(out).path, "utf8");
     expect(raw).not.toContain("runAs:");
     expect(raw).not.toContain("model:");
-    expect(raw).not.toContain("max-iters:");
     expect(raw).not.toContain("allowed-tools:");
   });
 
@@ -407,5 +441,116 @@ describe("install_skill tool", () => {
     const raw = readFileSync(JSON.parse(out).path, "utf8");
     expect(raw).toContain("description: first line second line third");
     expect(raw).not.toMatch(/description: first line\n/);
+  });
+});
+
+describe("built-in subagent tools (explore / research / review / security_review)", () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "reasonix-builtin-subagent-"));
+  });
+
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("registers all four built-in subagent tools when builtins are enabled", () => {
+    const reg = new ToolRegistry();
+    registerSkillTools(reg, { homeDir: home, subagentRunner: async () => "ok" });
+    expect(reg.get("explore")?.readOnly).toBe(true);
+    expect(reg.get("research")?.readOnly).toBe(true);
+    expect(reg.get("review")?.readOnly).toBe(true);
+    expect(reg.get("security_review")?.readOnly).toBe(true);
+  });
+
+  it("does not register the wrappers when builtins are disabled", () => {
+    const reg = new ToolRegistry();
+    registerSkillTools(reg, {
+      homeDir: home,
+      disableBuiltins: true,
+      subagentRunner: async () => "ok",
+    });
+    expect(reg.get("explore")).toBeUndefined();
+    expect(reg.get("research")).toBeUndefined();
+    expect(reg.get("review")).toBeUndefined();
+    expect(reg.get("security_review")).toBeUndefined();
+  });
+
+  it("dispatches `explore` straight to subagentRunner with the explore skill body + task", async () => {
+    const reg = new ToolRegistry();
+    let received: { name: string; bodySnippet: string; task: string } | null = null;
+    registerSkillTools(reg, {
+      homeDir: home,
+      subagentRunner: async (skill, task) => {
+        received = { name: skill.name, bodySnippet: skill.body.slice(0, 80), task };
+        return JSON.stringify({ success: true, output: "explore-said-this" });
+      },
+    });
+    const out = await reg.dispatch("explore", {
+      task: "find every caller of fixToolCallPairing",
+    });
+    expect(received?.name).toBe("explore");
+    expect(received?.bodySnippet).toMatch(/exploration subagent/);
+    expect(received?.task).toBe("find every caller of fixToolCallPairing");
+    expect(JSON.parse(out).output).toBe("explore-said-this");
+  });
+
+  it("maps the security_review tool name to the security-review skill (hyphen mapping)", async () => {
+    const reg = new ToolRegistry();
+    let receivedName: string | null = null;
+    registerSkillTools(reg, {
+      homeDir: home,
+      subagentRunner: async (skill) => {
+        receivedName = skill.name;
+        return JSON.stringify({ success: true, output: "sec-said-this" });
+      },
+    });
+    await reg.dispatch("security_review", { task: "focus on token handling" });
+    expect(receivedName).toBe("security-review");
+  });
+
+  it("errors when no subagentRunner is configured", async () => {
+    const reg = new ToolRegistry();
+    // No subagentRunner — the wrappers should still register but refuse to dispatch.
+    registerSkillTools(reg, { homeDir: home });
+    const out = await reg.dispatch("explore", { task: "anything" });
+    expect(JSON.parse(out).error).toMatch(/no subagent runner is configured/);
+  });
+
+  it("requires a non-empty task", async () => {
+    const reg = new ToolRegistry();
+    let runnerCalls = 0;
+    registerSkillTools(reg, {
+      homeDir: home,
+      subagentRunner: async () => {
+        runnerCalls++;
+        return "x";
+      },
+    });
+    const out = await reg.dispatch("research", { task: "   " });
+    expect(JSON.parse(out).error).toMatch(/non-empty 'task'/);
+    expect(runnerCalls).toBe(0);
+  });
+
+  it("bounces to run_skill when a user override flips the skill to runAs: inline", async () => {
+    writeSkillWithFrontmatter(
+      home,
+      "review",
+      { description: "user inline override", runAs: "inline" },
+      "Custom inline review playbook.",
+    );
+    const reg = new ToolRegistry();
+    let runnerCalls = 0;
+    registerSkillTools(reg, {
+      homeDir: home,
+      subagentRunner: async () => {
+        runnerCalls++;
+        return "x";
+      },
+    });
+    const out = await reg.dispatch("review", { task: "the diff" });
+    expect(JSON.parse(out).error).toMatch(/overridden as inline.*run_skill/);
+    expect(runnerCalls).toBe(0);
   });
 });

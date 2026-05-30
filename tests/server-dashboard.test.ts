@@ -5,7 +5,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { addProjectShellAllowed, loadProjectShellAllowed } from "../src/config.js";
+import { addProjectShellAllowed, loadProjectShellAllowed, readConfig } from "../src/config.js";
 import type { DashboardContext } from "../src/server/context.js";
 import {
   type DashboardServerHandle,
@@ -209,6 +209,30 @@ describe("dashboard server: endpoints", () => {
     expect(r.body.cockpit.currentSession).toBeNull();
   });
 
+  it("serves browser bridge @-mention search and preview compatibility endpoints", async () => {
+    const projectDir = join(dir, "project");
+    await mkdir(join(projectDir, "src"), { recursive: true });
+    await writeFile(
+      join(projectDir, "src", "app.ts"),
+      "export const app = 1;\nconsole.log(app);\n",
+    );
+    await writeFile(join(projectDir, "README.md"), "# demo\n");
+
+    const base = await boot({ getCurrentCwd: () => projectDir });
+
+    const search = await call(`${base}api/files/search?q=app`, { token: TOKEN });
+    expect(search.status).toBe(200);
+    expect(search.body.results).toContain("src/app.ts");
+
+    const preview = await call(`${base}api/file-read?path=src%2Fapp.ts&nonce=7`, { token: TOKEN });
+    expect(preview.status).toBe(200);
+    expect(preview.body).toMatchObject({
+      path: "src/app.ts",
+      head: "export const app = 1;\nconsole.log(app);",
+      totalLines: 2,
+    });
+  });
+
   it("GET /api/usage returns aggregateUsage + record count", async () => {
     const base = await boot();
     const r = await call(`${base}api/usage`, { token: TOKEN });
@@ -352,6 +376,35 @@ describe("dashboard server: endpoints", () => {
       expect(audited.map((e) => e.action)).toEqual(["save-skill", "delete-skill"]);
     } finally {
       rmSync(proj, { recursive: true, force: true });
+    }
+  });
+
+  it("GET /api/skills returns custom skills and path status", async () => {
+    const proj = mkdtempSync(join(tmpdir(), "reasonix-dash-skills-custom-proj-"));
+    const custom = mkdtempSync(join(tmpdir(), "reasonix-dash-skills-custom-"));
+    try {
+      await writeFile(
+        cfgPath,
+        JSON.stringify({ skills: { paths: [custom, join(proj, "missing")] } }),
+        "utf8",
+      );
+      await mkdir(join(custom, "custom-skill"), { recursive: true });
+      await writeFile(
+        join(custom, "custom-skill", "SKILL.md"),
+        "---\ndescription: Custom skill\n---\ncustom body\n",
+        "utf8",
+      );
+      const base = await boot({ getCurrentCwd: () => proj });
+      const list = await call(`${base}api/skills`, { token: TOKEN });
+      expect(list.status).toBe(200);
+      expect(list.body.custom.map((s: { name: string }) => s.name)).toEqual(["custom-skill"]);
+      expect(list.body.paths.custom.map((p: { status: string }) => p.status)).toEqual([
+        "ok",
+        "missing",
+      ]);
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+      rmSync(custom, { recursive: true, force: true });
     }
   });
 
@@ -713,6 +766,32 @@ describe("dashboard server: chat bridge", () => {
     ac.abort();
   });
 
+  it("GET /api/events replays the active modal so mid-modal connects see the gate (#1770)", async () => {
+    const base = await boot({
+      isBusy: () => false,
+      subscribeEvents: () => () => undefined,
+      getActiveModal: () => ({
+        kind: "shell",
+        command: "npm install",
+        allowPrefix: "npm",
+        shellKind: "stdin",
+      }),
+    });
+    const ac = new AbortController();
+    const res = await fetch(`${base}api/events?token=${TOKEN}`, { signal: ac.signal });
+    expect(res.status).toBe(200);
+    const reader = res.body!.getReader();
+    let combined = "";
+    for (let i = 0; i < 3 && !combined.includes("modal-up"); i++) {
+      const { value } = await reader.read();
+      if (value) combined += new TextDecoder().decode(value);
+    }
+    expect(combined).toContain("modal-up");
+    expect(combined).toContain("npm install");
+    reader.cancel().catch(() => undefined);
+    ac.abort();
+  });
+
   it("GET /api/events without a subscribeEvents callback returns 503", async () => {
     const base = await boot({});
     const r = await fetch(`${base}api/events?token=${TOKEN}`);
@@ -726,12 +805,21 @@ describe("dashboard server: v0.13 panels", () => {
   let cfgPath: string;
   let usagePath: string;
   let handle: DashboardServerHandle | null = null;
+  let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
   const TOKEN = "d".repeat(64);
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "reasonix-dash-v013-"));
     cfgPath = join(dir, "config.json");
     usagePath = join(dir, "usage.jsonl");
+    // Handlers like /api/health still walk `homedir()/.reasonix/{sessions,memory,semantic}`,
+    // so without redirecting HOME the test reads the dev's real history. On a machine
+    // with ~20k sessions the readdir + per-file statSync chain blows past the 5s default.
+    savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    process.env.HOME = dir;
+    process.env.USERPROFILE = dir;
     handle = await startDashboardServer(
       {
         mode: "attached",
@@ -745,6 +833,12 @@ describe("dashboard server: v0.13 panels", () => {
   afterEach(async () => {
     await handle?.close();
     if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    // biome-ignore lint/performance/noDelete: env-var "= undefined" stringifies, must really unset
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    // biome-ignore lint/performance/noDelete: env-var "= undefined" stringifies, must really unset
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
   });
 
   it("GET /api/health returns disk + version + jobs shape", async () => {
@@ -769,6 +863,33 @@ describe("dashboard server: v0.13 panels", () => {
   it("GET /api/sessions/<missing> returns 404", async () => {
     const base = handle!.url.split("?")[0]!;
     const r = await call(`${base}api/sessions/no-such-session`, { token: TOKEN });
+    expect(r.status).toBe(404);
+  });
+
+  it("GET /api/sessions returns canSwitch=false when no switchSession callback is wired", async () => {
+    const base = handle!.url.split("?")[0]!;
+    const r = await call(`${base}api/sessions`, { token: TOKEN });
+    expect(r.status).toBe(200);
+    expect(r.body.canSwitch).toBe(false);
+  });
+
+  it("POST /api/sessions/new returns 503 without an attached switchSession callback", async () => {
+    const base = handle!.url.split("?")[0]!;
+    const r = await call(`${base}api/sessions/new`, {
+      token: TOKEN,
+      tokenInHeader: true,
+      method: "POST",
+    });
+    expect(r.status).toBe(503);
+  });
+
+  it("DELETE /api/sessions/<missing> returns 404", async () => {
+    const base = handle!.url.split("?")[0]!;
+    const r = await call(`${base}api/sessions/never-existed`, {
+      token: TOKEN,
+      tokenInHeader: true,
+      method: "DELETE",
+    });
     expect(r.status).toBe(404);
   });
 
@@ -1043,14 +1164,12 @@ describe("dashboard server: D-1 settings + auto-loop surface", () => {
     return handle.url.split("?")[0]!;
   }
 
-  it("POST /api/settings routes proNext / budgetUsd / model to live callbacks", async () => {
+  it("POST /api/settings routes budgetUsd / model to live callbacks", async () => {
     const calls: Record<string, unknown[]> = {
-      proNext: [],
       budgetUsd: [],
       model: [],
     };
     const base = await boot({
-      setProNextLive: (v) => calls.proNext!.push(v),
       setBudgetUsdLive: (v) => calls.budgetUsd!.push(v),
       applyModelLive: (v) => calls.model!.push(v),
     });
@@ -1058,13 +1177,45 @@ describe("dashboard server: D-1 settings + auto-loop surface", () => {
       method: "POST",
       token: TOKEN,
       tokenInHeader: true,
-      body: { proNext: true, budgetUsd: 2.5, model: "deepseek-v4-pro" },
+      body: { budgetUsd: 2.5, model: "deepseek-v4-pro" },
     });
     expect(r.status).toBe(200);
-    expect(r.body.changed).toEqual(expect.arrayContaining(["proNext", "budgetUsd", "model"]));
-    expect(calls.proNext).toEqual([true]);
+    expect(r.body.changed).toEqual(expect.arrayContaining(["budgetUsd", "model"]));
     expect(calls.budgetUsd).toEqual([2.5]);
     expect(calls.model).toEqual(["deepseek-v4-pro"]);
+  });
+
+  it("POST /api/settings persists and applies editMode", async () => {
+    const editModeCalls: unknown[] = [];
+    const base = await boot({
+      getEditMode: () => "review",
+      setEditMode: (mode) => {
+        editModeCalls.push(mode);
+        return mode;
+      },
+    });
+    const r = await call(`${base}api/settings`, {
+      method: "POST",
+      token: TOKEN,
+      tokenInHeader: true,
+      body: { editMode: "auto" },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body.changed).toContain("editMode");
+    expect(readConfig(cfgPath).editMode).toBe("auto");
+    expect(editModeCalls).toEqual(["auto"]);
+  });
+
+  it("POST /api/settings rejects invalid editMode", async () => {
+    const base = await boot();
+    const r = await call(`${base}api/settings`, {
+      method: "POST",
+      token: TOKEN,
+      tokenInHeader: true,
+      body: { editMode: "danger" },
+    });
+    expect(r.status).toBe(400);
+    expect(readConfig(cfgPath).editMode).toBeUndefined();
   });
 
   it("POST /api/settings rejects non-positive budgetUsd", async () => {
@@ -1207,11 +1358,21 @@ describe("dashboard server: checkpoint API", () => {
     await mkdir(cwd, { recursive: true });
     await writeFile(join(cwd, "hello.txt"), "hello world\n");
     const { execSync } = await import("node:child_process");
-    execSync("git init", { cwd });
-    execSync("git config user.email test@test.com", { cwd });
-    execSync("git config user.name test", { cwd });
-    execSync("git add -A", { cwd });
-    execSync("git commit -m init", { cwd });
+    // Strip GIT_* env vars so execSync doesn't inherit them from a calling
+    // git operation (e.g. when this suite runs under a pre-push hook).
+    // Without this, `git commit` would resolve GIT_DIR from the env and
+    // operate on the parent repo, not the temp dir — and `git config
+    // user.email test@test.com` would silently rewrite the parent's
+    // committer identity.
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (k.startsWith("GIT_")) delete env[k];
+    }
+    execSync("git init", { cwd, env });
+    execSync("git config user.email test@test.com", { cwd, env });
+    execSync("git config user.name test", { cwd, env });
+    execSync("git add -A", { cwd, env });
+    execSync("git commit -m init", { cwd, env });
   });
 
   afterEach(async () => {

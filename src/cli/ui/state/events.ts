@@ -100,6 +100,8 @@ const turnEnd = z.object({
   /** Model context window — drives the prompt-bar denominator on the auto-emitted UsageCard. */
   promptCap: z.number().int().positive().optional(),
   elapsedMs: z.number().nonnegative().optional(),
+  /** Session-aggregate cache-hit ratio routed into `status.cacheHit` so the persistent bottom bar matches the web dashboard's number. When absent, the reducer falls back to the per-turn `usage.cacheHit`. */
+  sessionCacheHit: z.number().min(0).max(1).optional(),
 });
 
 const modeChange = z.object({
@@ -120,6 +122,7 @@ const sessionUpdate = z.object({
     sessionCost: z.number().optional(),
     balance: z.number().optional(),
     balanceCurrency: z.string().optional(),
+    costDisplayCurrency: z.string().optional(),
     cacheHit: z.number().optional(),
   }),
 });
@@ -129,9 +132,9 @@ const sessionModelChange = z.object({
   model: z.string().min(1),
 });
 
-const sessionPresetChange = z.object({
-  type: z.literal("session.preset.change"),
-  preset: z.enum(["auto", "flash", "pro"]).nullable(),
+const sessionEffortChange = z.object({
+  type: z.literal("session.effort.change"),
+  reasoningEffort: z.enum(["low", "medium", "high", "max"]),
 });
 
 const mcpLoading = z.object({
@@ -196,6 +199,12 @@ const sessionReset = z.object({
   type: z.literal("session.reset"),
 });
 
+const sessionFork = z.object({
+  type: z.literal("session.fork"),
+  /** Drop this card and everything after it. */
+  cardId: cardId,
+});
+
 const sessionWorkspaceChange = z.object({
   type: z.literal("session.workspace.change"),
   id: z.string().min(1),
@@ -228,6 +237,10 @@ const planStepComplete = z.object({
 
 const planDrop = z.object({
   type: z.literal("plan.drop"),
+});
+
+const planIdle = z.object({
+  type: z.literal("plan.idle"),
 });
 
 const usageShow = z.object({
@@ -336,7 +349,7 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
   languageChange,
   sessionUpdate,
   sessionModelChange,
-  sessionPresetChange,
+  sessionEffortChange,
   mcpLoading,
   focusMove,
   focusSet,
@@ -351,10 +364,12 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
   liveShow,
   tipShow,
   sessionReset,
+  sessionFork,
   sessionWorkspaceChange,
   planShow,
   planStepComplete,
   planDrop,
+  planIdle,
   ctxShow,
   doctorShow,
   usageShow,

@@ -1,3 +1,4 @@
+import { isAbsolute, parse, relative, resolve } from "node:path";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import {
   type DirEntry,
@@ -9,7 +10,9 @@ import {
   rankPickerCandidates,
   walkFilesStream,
 } from "../../at-mentions.js";
+import { type ReasoningEffort, loadResolvedSkillPaths } from "../../config.js";
 import { SkillStore } from "../../skills.js";
+import { effortArgsHintFor } from "./effort-choices.js";
 import {
   type McpServerSummary,
   type SlashArgContext,
@@ -18,6 +21,7 @@ import {
   detectSlashArgContext,
   suggestSlashCommands,
 } from "./slash.js";
+import { type ThemeChoice, themeChoiceLabel } from "./theme/labels.js";
 
 export interface UseCompletionPickersParams {
   input: string;
@@ -29,6 +33,8 @@ export interface UseCompletionPickersParams {
   mcpServers: McpServerSummary[] | undefined;
   /** Cross-session slash invocation counts — used to sort suggestions by frequency. */
   slashUsage?: Readonly<Record<string, number>>;
+  /** Filtered effort enum for the active endpoint — drops "max" on non-DeepSeek hosts (#1794). */
+  effortChoices: readonly ReasoningEffort[];
 }
 
 export interface AtPickerEntry {
@@ -39,6 +45,8 @@ export interface AtPickerEntry {
   /** Dim suffix shown after the label ("src/auth/" for "src/auth/login.ts" search hits). Empty in browse mode. */
   dirSuffix: string;
   isDir: boolean;
+  /** Synthetic parent-nav entry (#1019) — always drills regardless of pick action so Enter doesn't commit "@<parent> " as a literal mention. */
+  synthetic?: "parent";
 }
 
 export type AtPickerState =
@@ -73,7 +81,11 @@ export interface UseCompletionPickersResult {
   slashArgMatches: readonly string[] | null;
   slashArgSelected: number;
   setSlashArgSelected: React.Dispatch<React.SetStateAction<number>>;
-  pickSlashArg: (chosen: string) => void;
+  /** When the completer is `"path"`, carries the rich entries (with `isDir`) so
+   *  callers can distinguish directories from files for drill-down vs commit. */
+  slashArgPathCandidates: readonly AtPickerEntry[] | null;
+  /** `isDir` controls drill vs. commit for path completers; ignored for other types. */
+  pickSlashArg: (chosen: string, isDir?: boolean) => void;
 }
 
 const SEARCH_DEBOUNCE_MS = 80;
@@ -89,13 +101,15 @@ export function useCompletionPickers({
   models,
   mcpServers,
   slashUsage,
+  effortChoices,
 }: UseCompletionPickersParams): UseCompletionPickersResult {
   // ── slash-name picker ──
   const [slashSelected, setSlashSelected] = useState(0);
   const slashMatches = useMemo(() => {
     if (!input.startsWith("/") || input.includes(" ")) return null;
-    return suggestSlashCommands(input.slice(1), !!codeMode, slashUsage);
-  }, [input, codeMode, slashUsage]);
+    const raw = suggestSlashCommands(input.slice(1), !!codeMode, slashUsage);
+    return raw.map((spec) => rewriteEffortSpec(spec, effortChoices));
+  }, [input, codeMode, slashUsage, effortChoices]);
   const slashGroupMode = input === "/";
   const slashAdvancedHidden = useMemo(
     () => (slashGroupMode ? countAdvancedCommands(!!codeMode) : 0),
@@ -148,17 +162,29 @@ export function useCompletionPickers({
   const atState = useMemo<AtPickerState | null>(() => {
     if (!parsed) return null;
     if (atMode === "browse") {
+      const entries = browseDir
+        ? ([parentBrowseEntry(browseDir), ...browse.entries] as readonly AtPickerEntry[])
+        : browse.entries;
       return {
         kind: "browse",
         baseDir: browseDir,
-        entries: browse.entries,
+        entries,
         loading: browse.loading,
       };
+    }
+    // When the user already typed a directory prefix (e.g. `@dir/fil`),
+    // filter search results to only files under that directory so a
+    // shorter same-name match from elsewhere (e.g. root `.gitignore`)
+    // doesn't steal the picker selection.
+    const dirPrefix = parsed.dir ? `${parsed.dir}/` : "";
+    let filtered = search.entries;
+    if (dirPrefix) {
+      filtered = search.entries.filter((e) => e.insertPath.startsWith(dirPrefix));
     }
     return {
       kind: "search",
       filter: parsed.filter,
-      entries: search.entries,
+      entries: filtered,
       scanned: search.scanned,
       searching: search.searching,
     };
@@ -177,8 +203,8 @@ export function useCompletionPickers({
     (entry: AtPickerEntry, action: "commit" | "drill") => {
       if (!atPicker) return;
       const before = input.slice(0, atPicker.atOffset);
-      const tail =
-        action === "drill" && entry.isDir ? `${entry.insertPath}/` : `${entry.insertPath} `;
+      const shouldDrill = entry.synthetic === "parent" || (action === "drill" && entry.isDir);
+      const tail = shouldDrill ? `${entry.insertPath}/` : `${entry.insertPath} `;
       setInput(`${before}@${tail}`);
     },
     [atPicker, input, setInput],
@@ -189,8 +215,22 @@ export function useCompletionPickers({
   const slashArgContext = useMemo<SlashArgContext | null>(() => {
     if (!input.startsWith("/")) return null;
     if (slashMatches !== null) return null;
-    return detectSlashArgContext(input, !!codeMode);
-  }, [input, slashMatches, codeMode]);
+    const ctx = detectSlashArgContext(input, !!codeMode);
+    if (!ctx) return null;
+    return ctx.kind === "picker"
+      ? { ...ctx, spec: rewriteEffortSpec(ctx.spec, effortChoices) }
+      : ctx;
+  }, [input, slashMatches, codeMode, effortChoices]);
+
+  // Path completion: async directory listing for `argCompleter: "path"`.
+  const slashArgPathCandidates = usePathCandidates(
+    rootDir,
+    slashArgContext?.kind === "picker" && slashArgContext.spec.argCompleter === "path"
+      ? slashArgContext.partial
+      : null,
+    slashArgContext?.kind === "picker" && slashArgContext.spec.argCompleter === "path",
+  );
+
   const slashArgMatches = useMemo<readonly string[] | null>(() => {
     if (!slashArgContext || slashArgContext.kind !== "picker") return null;
     const completer = slashArgContext.spec.argCompleter;
@@ -199,7 +239,13 @@ export function useCompletionPickers({
     if (Array.isArray(completer)) {
       if (partial && completer.some((v) => v.toLowerCase() === needle)) return null;
       if (!partial) return completer.slice();
-      return completer.filter((v) => v.toLowerCase().startsWith(needle));
+      return completer.filter((v) => {
+        if (v.toLowerCase().startsWith(needle)) return true;
+        if (slashArgContext.spec.cmd !== "theme") return false;
+        return themeChoiceLabel(v as ThemeChoice)
+          .toLowerCase()
+          .includes(needle);
+      });
     }
     if (completer === "models") {
       const all = models ?? [];
@@ -230,17 +276,24 @@ export function useCompletionPickers({
       return names.filter((n) => n.toLowerCase().includes(needle)).slice(0, 40);
     }
     if (completer === "skills") {
-      const store = new SkillStore({ projectRoot: codeMode?.rootDir });
-      const names = store
-        .list()
-        .filter((s) => s.scope !== "builtin")
-        .map((s) => s.name);
+      const baseDir = codeMode?.rootDir ?? process.cwd();
+      const store = new SkillStore({
+        projectRoot: codeMode?.rootDir,
+        customSkillPaths: loadResolvedSkillPaths(baseDir),
+      });
+      const names = store.list().map((s) => s.name);
       if (partial && names.some((n) => n.toLowerCase() === needle)) return null;
       if (!partial) return names.slice(0, 40);
       return names.filter((n) => n.toLowerCase().includes(needle)).slice(0, 40);
     }
+    if (completer === "path") {
+      // Async-listed entries — map the rich candidates to strings.
+      // `slashArgPathCandidates` is populated by `usePathCandidates`;
+      // this memo re-fires when the async listing completes.
+      return slashArgPathCandidates.map((e) => e.insertPath);
+    }
     return null;
-  }, [slashArgContext, models, mcpServers, codeMode]);
+  }, [slashArgContext, models, mcpServers, codeMode, slashArgPathCandidates]);
   useEffect(() => {
     setSlashArgSelected((prev) => {
       if (!slashArgMatches || slashArgMatches.length === 0) return 0;
@@ -249,10 +302,19 @@ export function useCompletionPickers({
     });
   }, [slashArgMatches]);
   const pickSlashArg = useCallback(
-    (chosen: string) => {
+    (chosen: string, isDir?: boolean) => {
       if (!slashArgContext) return;
       const before = input.slice(0, slashArgContext.partialOffset);
-      setInput(`${before}${chosen}`);
+      if (isDir === true) {
+        // Directory drill-down — trailing slash re-opens the picker for deeper navigation.
+        setInput(`${before}${chosen}/`);
+      } else if (isDir === false) {
+        // Leaf commit — trailing space closes the picker (the user lands on Enter-to-run).
+        setInput(`${before}${chosen} `);
+      } else {
+        // Non-path completer (models, skills, etc.) — no suffix.
+        setInput(`${before}${chosen}`);
+      }
     },
     [slashArgContext, input, setInput],
   );
@@ -272,8 +334,116 @@ export function useCompletionPickers({
     slashArgMatches,
     slashArgSelected,
     setSlashArgSelected,
+    slashArgPathCandidates,
     pickSlashArg,
   };
+}
+
+/** Async directory listing for `argCompleter: "path"` (e.g. `/cwd`). Lists entries, sorts dirs first, caps at SEARCH_RESULT_CAP. */
+function usePathCandidates(
+  rootDir: string,
+  partial: string | null,
+  isActive: boolean,
+): readonly AtPickerEntry[] {
+  const [entries, setEntries] = useState<readonly AtPickerEntry[]>([]);
+
+  useEffect(() => {
+    if (!isActive) {
+      setEntries([]);
+      return;
+    }
+    if (partial === null) {
+      setEntries([]);
+      return;
+    }
+    let cancelled = false;
+
+    // Resolve the partial to a (listRoot, relPartial) pair.
+    // Absolute paths list from filesystem root.  Relative paths that escape
+    // rootDir via `..` resolve to absolute and list from / instead.
+    const hasTrailingSlash = partial.endsWith("/");
+    let listRoot: string;
+    let relPartial: string;
+    let insertIsAbsolute: boolean;
+
+    if (isAbsolute(partial)) {
+      // Absolute path → list from the drive root (C:\ on Windows, / on POSIX).
+      const root = parse(partial).root;
+      listRoot = root;
+      relPartial = partial.slice(root.length).replace(/\\/g, "/");
+      insertIsAbsolute = true;
+    } else {
+      // Relative path — check whether it escapes rootDir.
+      const resolved = resolve(rootDir, partial);
+      const relToRoot = relative(rootDir, resolved);
+      if (relToRoot.startsWith("..") || isAbsolute(relToRoot)) {
+        // Escapes rootDir — resolve to absolute and list from the drive root.
+        const root = parse(resolved).root;
+        listRoot = root;
+        relPartial = resolved.slice(root.length).replace(/\\/g, "/");
+        if (hasTrailingSlash && !relPartial.endsWith("/")) relPartial += "/";
+        insertIsAbsolute = true;
+      } else {
+        // Stays inside rootDir — normal relative listing.
+        listRoot = rootDir;
+        relPartial = partial;
+        insertIsAbsolute = false;
+      }
+    }
+
+    // Parse the partial argument to split parent-dir from filename filter.
+    const parsed = parseAtQuery(relPartial);
+    const dir = parsed.dir; // parent directory (empty = root)
+    const filter = parsed.filter.toLowerCase();
+
+    listDirectory(listRoot, dir)
+      .then((raw) => {
+        if (cancelled) return;
+
+        // Only directories — /cwd only accepts directory paths.
+        let result: DirEntry[] = raw.filter((e) => e.isDir);
+        if (filter) {
+          result = result.filter((e) => e.name.toLowerCase().startsWith(filter));
+        }
+
+        // Cap to match @-mention search so a directory with 10k+ entries
+        // doesn't blow out memory or block the UI on a single render.
+        if (result.length > SEARCH_RESULT_CAP) {
+          result = result.slice(0, SEARCH_RESULT_CAP);
+        }
+
+        const listRootNorm = listRoot.replace(/\\/g, "/");
+        const mapped: AtPickerEntry[] = result.map((e) => ({
+          label: e.name,
+          insertPath: insertIsAbsolute
+            ? dir
+              ? `${listRootNorm}${dir}/${e.name}`
+              : `${listRootNorm}${e.name}`
+            : dir
+              ? `${dir}/${e.name}`
+              : e.name,
+          dirSuffix: "",
+          isDir: e.isDir,
+        }));
+
+        // Directories first, then files; alpha within each group.
+        mapped.sort((a, b) => {
+          if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+          return a.label.localeCompare(b.label);
+        });
+
+        setEntries(mapped);
+      })
+      .catch(() => {
+        if (!cancelled) setEntries([]);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rootDir, partial, isActive]);
+
+  return entries;
 }
 
 function useBrowseListing(rootDir: string, dir: string | null) {
@@ -308,6 +478,19 @@ function useBrowseListing(rootDir: string, dir: string | null) {
 
 function toBrowseEntry(d: DirEntry): AtPickerEntry {
   return { label: d.name, insertPath: d.path, dirSuffix: "", isDir: d.isDir };
+}
+
+/** Synthetic "go to parent" entry for browse mode (#1019). insertPath = "" routes drill back to the workspace root. */
+function parentBrowseEntry(currentDir: string): AtPickerEntry {
+  const idx = currentDir.lastIndexOf("/");
+  const parentDir = idx >= 0 ? currentDir.slice(0, idx) : "";
+  return {
+    label: "..",
+    insertPath: parentDir,
+    dirSuffix: parentDir ? `↑ ${parentDir}/` : "↑ /",
+    isDir: true,
+    synthetic: "parent",
+  };
 }
 
 function useStreamingSearch(
@@ -398,4 +581,20 @@ function rankSearchHits(
       isDir: false,
     };
   });
+}
+
+/** Drops `max` from the /effort spec's argsHint + argCompleter when the
+ *  active endpoint is non-DeepSeek so vLLM/Azure users don't see an option
+ *  that would 400 their next call (#1794). No-op for any other command. */
+function rewriteEffortSpec(
+  spec: SlashCommandSpec,
+  effortChoices: readonly ReasoningEffort[],
+): SlashCommandSpec {
+  if (spec.cmd !== "effort") return spec;
+  if (effortChoices.length === 4) return spec;
+  return {
+    ...spec,
+    argsHint: effortArgsHintFor(effortChoices),
+    argCompleter: [...effortChoices],
+  };
 }

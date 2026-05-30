@@ -226,6 +226,12 @@ describe("StdinReader — bracketed paste", () => {
     expect(events).toEqual([{ input: "hello\nworld", paste: true }]);
   });
 
+  it("normalizes Windows CRLF and bare CR line endings inside paste events", () => {
+    const { reader, events } = setup();
+    reader.feed("\x1b[200~first\r\nsecond\rthird\x1b[201~");
+    expect(events).toEqual([{ input: "first\nsecond\nthird", paste: true }]);
+  });
+
   it("paste content is collected across multiple feed calls (chunked stdin)", () => {
     const { reader, events } = setup();
     reader.feed("\x1b[200~hello\n");
@@ -253,10 +259,25 @@ describe("StdinReader — bracketed paste", () => {
     expect(events).toEqual([{ input: "ab" }, { input: "stuff", paste: true }]);
   });
 
-  it("printable runs do not eat a following ESC-less arrow tail", () => {
+  it("ESC-less arrow tail followed by another CSI prefix still recovers", () => {
     const { reader, events } = setup();
-    reader.feed("ab[Ccd");
-    expect(events).toEqual([{ input: "ab" }, { input: "", rightArrow: true }, { input: "cd" }]);
+    reader.feed("[C[A");
+    expect(events).toEqual([
+      { input: "", rightArrow: true },
+      { input: "", upArrow: true },
+    ]);
+  });
+
+  it("typed `[DEBUG]` is not misread as left-arrow + EBUG] (#1771)", () => {
+    const { reader, events } = setup();
+    reader.feed("[DEBUG]");
+    expect(events).toEqual([{ input: "[DEBUG]" }]);
+  });
+
+  it("typed `[ABC]`-shaped tokens stay intact (no upArrow split)", () => {
+    const { reader, events } = setup();
+    reader.feed("[Aabc");
+    expect(events).toEqual([{ input: "[Aabc" }]);
   });
 });
 
@@ -266,13 +287,13 @@ describe("StdinReader — heuristic paste rescue (#522)", () => {
     // multi-line content used to fire one Enter per \r and submit N times.
     const { reader, events } = setup();
     reader.feed("first line\rsecond line\rthird line");
-    expect(events).toEqual([{ input: "first line\rsecond line\rthird line", paste: true }]);
+    expect(events).toEqual([{ input: "first line\nsecond line\nthird line", paste: true }]);
   });
 
   it("treats a single-break chunk with text on both sides as a paste", () => {
     const { reader, events } = setup();
     reader.feed("hello\rworld");
-    expect(events).toEqual([{ input: "hello\rworld", paste: true }]);
+    expect(events).toEqual([{ input: "hello\nworld", paste: true }]);
   });
 
   it("leaves a bare Enter alone (\\r submits as before)", () => {
@@ -324,8 +345,8 @@ describe("StdinReader — heuristic paste rescue (#522)", () => {
   it("normalizes \\r\\n line endings inside the heuristic so Windows pastes still get one event", () => {
     const { reader, events } = setup();
     reader.feed("first\r\nsecond\r\nthird");
-    // Whole chunk wrapped → paste accumulator delivers verbatim
-    expect(events).toEqual([{ input: "first\r\nsecond\r\nthird", paste: true }]);
+    // Whole chunk wrapped → paste accumulator delivers normalized logical lines.
+    expect(events).toEqual([{ input: "first\nsecond\nthird", paste: true }]);
   });
 });
 
@@ -425,9 +446,54 @@ describe("StdinReader — SGR mouse reports (issue #867)", () => {
     reader.feed("[<not-a-mouse-report");
     expect(events).toEqual([{ input: "[<not-a-mouse-report" }]);
   });
+
+  it("drops legacy X10 mouse reports as a whole instead of leaking coordinate bytes", () => {
+    const { reader, events } = setup();
+    reader.feed("\x1b[M`*%");
+    expect(events).toEqual([]);
+  });
+
+  it("drops legacy X10 mouse reports even when split after the prefix", () => {
+    const { reader, events } = setup();
+    reader.feed("\x1b[M");
+    reader.feed("`*%");
+    expect(events).toEqual([]);
+  });
+
+  it("drops a legacy X10 mouse-report flood without surfacing prompt input (#1598)", () => {
+    const { reader, events } = setup();
+    for (let i = 0; i < 1000; i++) {
+      reader.feed("\x1b[M`*%");
+    }
+    expect(events).toEqual([]);
+  });
+
+  it("drops ESC-stripped legacy X10 mouse reports instead of leaking prompt input (#1598)", () => {
+    const { reader, events } = setup();
+    reader.feed("[M`*%");
+    expect(events).toEqual([]);
+  });
+
+  it("drops an ESC-stripped legacy X10 mouse-report flood without surfacing prompt input (#1598)", () => {
+    const { reader, events } = setup();
+    for (let i = 0; i < 1000; i++) {
+      reader.feed("[M`*%");
+    }
+    expect(events).toEqual([]);
+  });
+
+  it("keeps printable text around an ESC-stripped legacy X10 report intact", () => {
+    const { reader, events } = setup();
+    reader.feed("ab[M`*%cd");
+    expect(events).toEqual([{ input: "ab" }, { input: "cd" }]);
+  });
 });
 
 describe("sanitizePasteText (issue #849)", () => {
+  it("normalizes Windows CRLF and bare CR line endings (issue #1030)", () => {
+    expect(sanitizePasteText("first\r\nsecond\rthird")).toBe("first\nsecond\nthird");
+  });
+
   it("strips bidi override controls (LRE/RLE/PDF/LRO/RLO/isolates)", () => {
     const raw = "\u202ahello\u202c \u202bworld\u202c \u2066isolated\u2069";
     expect(sanitizePasteText(raw)).toBe("hello world isolated");

@@ -24,31 +24,33 @@ import { AcpServer } from "../../acp/server.js";
 import { codeSystemPrompt } from "../../code/prompt.js";
 import { buildCodeToolset } from "../../code/setup.js";
 import {
+  DEFAULT_MODEL,
+  bridgeEndpointEnv,
   loadApiKey,
-  loadBaseUrl,
-  loadPreset,
+  loadEditMode,
+  loadEndpoint,
+  loadMaxIterPerTurn,
+  loadModel,
   loadReasoningEffort,
-  mcpEnvFor,
+  normalizeMcpConfig,
   readConfig,
 } from "../../config.js";
-import { loadEditMode } from "../../config.js";
 import { Eventizer } from "../../core/eventize.js";
 import { pauseGate } from "../../core/pause-gate.js";
 import { autoResolveVerdict } from "../../core/pause-policy.js";
 import { loadDotenv } from "../../env.js";
 import { t } from "../../i18n/index.js";
 import { CacheFirstLoop, DeepSeekClient, ImmutablePrefix } from "../../index.js";
+import { errorMeta } from "../../loop/errors.js";
 import { McpClient } from "../../mcp/client.js";
 import { preflightStdioSpec } from "../../mcp/preflight.js";
 import { bridgeMcpTools } from "../../mcp/registry.js";
-import { parseMcpSpec } from "../../mcp/spec.js";
 import { buildTransportFromSpec } from "../../mcp/transport-from-spec.js";
 import { timestampSuffix } from "../../memory/session.js";
 import { openTranscriptFile, recordFromLoopEvent, writeRecord } from "../../transcript/log.js";
 import { VERSION } from "../../version.js";
 import { formatMcpLifecycleEvent } from "../ui/mcp-lifecycle.js";
 import { formatMcpSlowToast } from "../ui/mcp-toast.js";
-import { canonicalPresetName, resolvePreset } from "../ui/presets.js";
 
 export interface AcpOptions {
   model?: string;
@@ -70,7 +72,11 @@ interface Session {
   mcpClients: McpClient[];
   loop: CacheFirstLoop;
   eventizer: Eventizer;
-  ctx: { model: string; prefixHash: string; reasoningEffort: "high" | "max" };
+  ctx: {
+    model: string;
+    prefixHash: string;
+    reasoningEffort: import("../../config.js").ReasoningEffort;
+  };
   aborter: AbortController | null;
 }
 
@@ -89,27 +95,27 @@ export async function loadMcpServers(
   tools: import("../../tools.js").ToolRegistry,
   specs: string[],
   globalPrefix: string | undefined,
+  workspaceDir: string = process.cwd(),
 ): Promise<McpClient[]> {
   const clients: McpClient[] = [];
   if (specs.length === 0) return clients;
   const cfg = readConfig();
-  const disabledNames = new Set(cfg.mcpDisabled ?? []);
-  for (const raw of specs) {
+  const normalizedSpecs = normalizeMcpConfig(cfg, specs);
+  for (const spec of normalizedSpecs) {
     let label = "anon";
     let mcp: McpClient | undefined;
     try {
-      const spec = parseMcpSpec(raw);
       label = spec.name ?? "anon";
-      if (spec.name && disabledNames.has(spec.name)) {
+      if (spec.disabled) {
         process.stderr.write(`${formatMcpLifecycleEvent({ state: "disabled", name: label })}\n`);
         continue;
       }
       process.stderr.write(`${formatMcpLifecycleEvent({ state: "handshake", name: label })}\n`);
       const t0 = Date.now();
-      const prefix = resolveMcpPrefix(spec.name, specs.length, globalPrefix);
-      if (spec.transport === "stdio") preflightStdioSpec(spec);
-      const transport = buildTransportFromSpec(spec, { env: mcpEnvFor(spec.name, cfg) });
-      mcp = new McpClient({ transport });
+      const prefix = resolveMcpPrefix(spec.name, normalizedSpecs.length, globalPrefix);
+      if (spec.transport === "stdio") preflightStdioSpec(spec, { cwd: workspaceDir });
+      const transport = buildTransportFromSpec(spec, { cwd: workspaceDir });
+      mcp = new McpClient({ transport, workspaceDir, requestTimeoutMs: spec.requestTimeoutMs });
       await mcp.initialize();
       const bridge = await bridgeMcpTools(mcp, {
         registry: tools,
@@ -154,18 +160,24 @@ async function buildSession(opts: {
   budgetUsd?: number;
   mcpSpecs?: string[];
   mcpPrefix?: string;
+  systemAppend?: string;
 }): Promise<Session> {
-  const preset = canonicalPresetName(loadPreset());
-  const resolved = resolvePreset(preset);
-  const model = opts.modelOverride || resolved.model;
+  const model = opts.modelOverride || loadModel() || DEFAULT_MODEL;
   const toolset = await buildCodeToolset({ rootDir: opts.rootDir });
   // Bridge MCP tools BEFORE building the prefix so their specs make it into the cache key.
-  const mcpClients = await loadMcpServers(toolset.tools, opts.mcpSpecs ?? [], opts.mcpPrefix);
+  const mcpClients = await loadMcpServers(
+    toolset.tools,
+    opts.mcpSpecs ?? [],
+    opts.mcpPrefix,
+    opts.rootDir,
+  );
   const system = codeSystemPrompt(opts.rootDir, {
     hasSemanticSearch: toolset.semantic.enabled,
     modelId: model,
+    systemAppend: opts.systemAppend,
   });
-  const client = new DeepSeekClient({ baseUrl: loadBaseUrl() });
+  const ep = loadEndpoint();
+  const client = new DeepSeekClient({ apiKey: ep.apiKey, baseUrl: ep.baseUrl });
   const prefix = new ImmutablePrefix({ system, toolSpecs: toolset.tools.specs() });
   const loop = new CacheFirstLoop({
     client,
@@ -173,6 +185,7 @@ async function buildSession(opts: {
     tools: toolset.tools,
     model,
     budgetUsd: opts.budgetUsd,
+    maxIterPerTurn: loadMaxIterPerTurn(),
     session: `acp-${timestampSuffix()}`,
   });
   return {
@@ -194,9 +207,7 @@ async function buildSession(opts: {
 
 export async function acpCommand(opts: AcpOptions): Promise<void> {
   loadDotenv();
-  if (loadApiKey()) {
-    process.env.DEEPSEEK_API_KEY = loadApiKey();
-  }
+  bridgeEndpointEnv();
 
   const defaultDir = resolveDir(opts.dir, process.cwd());
   const sessions = new Map<string, Session>();
@@ -205,7 +216,7 @@ export async function acpCommand(opts: AcpOptions): Promise<void> {
 
   let transcriptStream: WriteStream | null = null;
   if (opts.transcript) {
-    const defaultModel = opts.model || resolvePreset(canonicalPresetName(loadPreset())).model;
+    const defaultModel = opts.model || loadModel() || DEFAULT_MODEL;
     transcriptStream = openTranscriptFile(opts.transcript, {
       version: 1,
       source: "reasonix acp",
@@ -256,6 +267,7 @@ export async function acpCommand(opts: AcpOptions): Promise<void> {
       budgetUsd: opts.budgetUsd,
       mcpSpecs: opts.mcpSpecs,
       mcpPrefix: opts.mcpPrefix,
+      systemAppend: process.env.REASONIX_ACP_SYSTEM_APPEND || undefined,
     });
     sessions.set(session.id, session);
     return { sessionId: session.id };
@@ -303,19 +315,30 @@ export async function acpCommand(opts: AcpOptions): Promise<void> {
         }
       });
     } catch (err) {
-      const message = (err as Error).message;
+      const cause = err instanceof Error ? err : new Error(String(err));
+      const message = cause.message;
+      const { code, phase } = errorMeta(cause);
       server.sendNotification("session/update", {
         sessionId: session.id,
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: `\n\n[error] ${message}` },
+          metadata: {
+            error: {
+              name: cause.name || "Error",
+              message,
+              code,
+              phase,
+              retryable: false,
+            },
+          },
         },
       } satisfies SessionUpdateParams);
       stopReason = "error";
     } finally {
       session.aborter = null;
     }
-    return { stopReason };
+    return { stopReason, transcriptPath: opts.transcript || null };
   });
 
   server.onNotification<SessionCancelParams>("session/cancel", (params) => {

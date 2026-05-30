@@ -1,5 +1,6 @@
-import { useAnimation } from "ink";
+import { useAnimationFrame } from "ink";
 import React, { type ReactNode, createContext, useContext, useState } from "react";
+import { isLegacyWindowsConsole } from "./terminal-host.js";
 
 /**
  * Two-tier global heartbeat backed by Ink 7's `useAnimation`. The
@@ -7,8 +8,8 @@ import React, { type ReactNode, createContext, useContext, useState } from "reac
  * lives inside Ink and consolidates with every other useAnimation
  * caller into a single shared interval.
  *
- *   - FAST_TICK_MS (120ms) — spinners, glyph pulses, anything that
- *     visibly animates frame-by-frame.
+ *   - FAST_TICK_MS (120ms / 250ms on legacy conhost) — spinners,
+ *     glyph pulses, anything that visibly animates frame-by-frame.
  *   - SLOW_TICK_MS (1000ms) — elapsed-seconds counters, expiry
  *     countdowns, polling pollers. Don't need 8Hz re-renders.
  *
@@ -17,7 +18,10 @@ import React, { type ReactNode, createContext, useContext, useState } from "reac
  * flips back, at which point Ink resets the frame counter to 0 (so
  * spinners restart from frame 0 — visually identical to a fresh mount).
  */
-export const FAST_TICK_MS = 120;
+// Spinner cadence — fast enough to look alive without burning cycles. With
+// incrementalRendering each tick only rewrites the spinner's line, so 16Hz is
+// cheap. Legacy conhost stays slower because each repaint is visible.
+export const FAST_TICK_MS = isLegacyWindowsConsole() ? 120 : 60;
 export const SLOW_TICK_MS = 1000;
 /** @deprecated kept for callers that import the old name. */
 export const TICK_MS = FAST_TICK_MS;
@@ -49,7 +53,8 @@ function useTickerActive(): boolean {
  */
 export function useTick(): number {
   const isActive = useTickerActive();
-  return useAnimation({ interval: FAST_TICK_MS, isActive }).frame;
+  const [, time] = useAnimationFrame(isActive ? FAST_TICK_MS : null);
+  return isActive ? Math.floor(time / FAST_TICK_MS) : 0;
 }
 
 /**
@@ -60,20 +65,8 @@ export function useTick(): number {
  */
 export function useSlowTick(): number {
   const isActive = useTickerActive();
-  return useAnimation({ interval: SLOW_TICK_MS, isActive }).frame;
-}
-
-/**
- * Cursor blink — 1Hz while the heartbeat is running; forced visible when
- * the ticker is suspended. Without the active-guard the raw frame stays
- * at whatever value it last reached (issue #728): a turn that lasts an
- * odd number of seconds leaves the cursor stuck off, so the user can't
- * tell where input lands.
- */
-export function useCursorBlink(): boolean {
-  const isActive = useTickerActive();
-  const tick = useSlowTick();
-  return !isActive || tick % 2 === 0;
+  const [, time] = useAnimationFrame(isActive ? SLOW_TICK_MS : null);
+  return isActive ? Math.floor(time / SLOW_TICK_MS) : 0;
 }
 
 /** Seconds elapsed since mount. Re-renders at 1Hz via the slow tick. */

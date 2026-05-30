@@ -3,10 +3,11 @@ import { Box, Text } from "ink";
 import React from "react";
 import { t } from "../../i18n/index.js";
 import type { CacheFirstLoop } from "../../loop.js";
-import { DEEPSEEK_CONTEXT_TOKENS, DEFAULT_CONTEXT_TOKENS } from "../../telemetry/stats.js";
-import { countTokens } from "../../tokenizer.js";
+import { resolveContextTokens } from "../../telemetry/stats.js";
+import { countTokensBounded } from "../../tokenizer.js";
 import { formatTokens } from "./primitives.js";
 import { COLOR } from "./theme.js";
+import { FG } from "./theme/tokens.js";
 
 export interface CtxBreakdownData {
   systemTokens: number;
@@ -17,17 +18,18 @@ export interface CtxBreakdownData {
   toolsCount: number;
   logMessages: number;
   topTools: Array<{ name: string; tokens: number; turn: number }>;
+  topToolSchemas: Array<{ name: string; tokens: number }>;
 }
 
 /**
- * Walk the loop's prefix + log and tally tokens per category. Cheap
- * after the tokenizer warm-up (~100 ms first call, sub-ms after).
- * Memoize at the call site if used inside a render path.
+ * Walk the loop's prefix + log and tally tokens per category.
+ * Uses bounded counting because `/context` can inspect oversized tool
+ * results before the next loop-healing pass trims them.
  */
 export function computeCtxBreakdown(loop: CacheFirstLoop): CtxBreakdownData {
-  const systemTokens = countTokens(loop.prefix.system);
-  const toolsTokens = countTokens(JSON.stringify(loop.prefix.toolSpecs));
-  const entries = loop.log.toMessages();
+  const systemTokens = countTokensBounded(loop.prefix.system);
+  const toolsTokens = countTokensBounded(JSON.stringify(loop.prefix.toolSpecs));
+  const entries = loop.log.toFullHistory();
   let userTokens = 0;
   let assistantTokens = 0;
   let toolResultTokens = 0;
@@ -37,22 +39,30 @@ export function computeCtxBreakdown(loop: CacheFirstLoop): CtxBreakdownData {
   for (const e of entries) {
     const content = typeof e.content === "string" ? e.content : "";
     if (e.role === "user") {
-      userTokens += countTokens(content);
+      userTokens += countTokensBounded(content);
       logTurn += 1;
     } else if (e.role === "assistant") {
-      assistantTokens += countTokens(content);
+      assistantTokens += countTokensBounded(content);
       if (Array.isArray(e.tool_calls) && e.tool_calls.length > 0) {
-        toolCallTokens += countTokens(JSON.stringify(e.tool_calls));
+        toolCallTokens += countTokensBounded(JSON.stringify(e.tool_calls));
       }
     } else if (e.role === "tool") {
-      const n = countTokens(content);
+      const n = countTokensBounded(content);
       toolResultTokens += n;
       toolBreakdown.push({ name: e.name ?? "?", tokens: n, turn: logTurn });
     }
   }
   const logTokens = userTokens + assistantTokens + toolResultTokens + toolCallTokens;
-  const ctxMax = DEEPSEEK_CONTEXT_TOKENS[loop.model] ?? DEFAULT_CONTEXT_TOKENS;
+  const ctxMax = resolveContextTokens(loop.model);
   const topTools = [...toolBreakdown].sort((a, b) => b.tokens - a.tokens).slice(0, 5);
+  const schemaCosts =
+    typeof loop.tools?.schemaTokenCosts === "function"
+      ? loop.tools.schemaTokenCosts()
+      : loop.prefix.toolSpecs.map((spec) => ({
+          name: spec.function.name,
+          tokens: countTokensBounded(JSON.stringify(spec)),
+        }));
+  const topToolSchemas = [...schemaCosts].sort((a, b) => b.tokens - a.tokens).slice(0, 5);
   return {
     systemTokens,
     toolsTokens,
@@ -62,6 +72,7 @@ export function computeCtxBreakdown(loop: CacheFirstLoop): CtxBreakdownData {
     toolsCount: loop.prefix.toolSpecs.length,
     logMessages: entries.length,
     topTools,
+    topToolSchemas,
   };
 }
 
@@ -98,8 +109,8 @@ export function CtxBreakdownBlock({ data }: { data: CtxBreakdownData }): React.R
         <Text color={COLOR.brand} bold>
           {t("ctxBreakdown.title")}
         </Text>
-        <Text dimColor>{`  ${formatTokens(total)} of ${formatTokens(data.ctxMax)}`}</Text>
-        <Text dimColor>{"  ·  "}</Text>
+        <Text color={FG.faint}>{`  ${formatTokens(total)} of ${formatTokens(data.ctxMax)}`}</Text>
+        <Text color={FG.faint}>{"  ·  "}</Text>
         <Text color={sevColor} bold>
           {`${winPct}%`}
         </Text>
@@ -114,41 +125,58 @@ export function CtxBreakdownBlock({ data }: { data: CtxBreakdownData }): React.R
         <Text color={COLOR.accent}>{"█".repeat(toolsCells)}</Text>
         <Text color={COLOR.primary}>{"█".repeat(logCells)}</Text>
         <Text color={COLOR.tool}>{"█".repeat(inputCells)}</Text>
-        <Text color={COLOR.info} dimColor>
-          {"░".repeat(freeCells)}
-        </Text>
+        <Text color={FG.faint}>{"░".repeat(freeCells)}</Text>
       </Box>
       <Box>
         <Text color={COLOR.brand}>■</Text>
-        <Text dimColor>{` ${t("cardLabels.system")} ${formatTokens(data.systemTokens)}`}</Text>
+        <Text
+          color={FG.faint}
+        >{` ${t("cardLabels.system")} ${formatTokens(data.systemTokens)}`}</Text>
         <Text>{"   "}</Text>
         <Text color={COLOR.accent}>■</Text>
-        <Text dimColor>{` ${t("cardLabels.tools")} ${formatTokens(data.toolsTokens)}`}</Text>
-        <Text dimColor>{` (${data.toolsCount})`}</Text>
+        <Text
+          color={FG.faint}
+        >{` ${t("cardLabels.tools")} ${formatTokens(data.toolsTokens)}`}</Text>
+        <Text color={FG.faint}>{` (${data.toolsCount})`}</Text>
         <Text>{"   "}</Text>
         <Text color={COLOR.primary}>■</Text>
-        <Text dimColor>{` ${t("cardLabels.log")} ${formatTokens(data.logTokens)}`}</Text>
-        <Text dimColor>{` (${data.logMessages} ${t("ctxBreakdown.msg")})`}</Text>
+        <Text color={FG.faint}>{` ${t("cardLabels.log")} ${formatTokens(data.logTokens)}`}</Text>
+        <Text color={FG.faint}>{` (${data.logMessages} ${t("ctxBreakdown.msg")})`}</Text>
         <Text>{"   "}</Text>
         <Text color={COLOR.tool}>■</Text>
-        <Text dimColor>{` ${t("cardLabels.input")} ${formatTokens(data.inputTokens)}`}</Text>
+        <Text
+          color={FG.faint}
+        >{` ${t("cardLabels.input")} ${formatTokens(data.inputTokens)}`}</Text>
       </Box>
       {data.topTools.length > 0 ? (
         <Box marginTop={1} flexDirection="column">
-          <Text dimColor>{t("ctxBreakdown.topTools", { count: data.topTools.length })}</Text>
+          <Text color={FG.faint}>
+            {t("ctxBreakdown.topTools", { count: data.topTools.length })}
+          </Text>
           {data.topTools.map((tool) => (
             <Box key={`${tool.turn}-${tool.name}`}>
               <Text
-                dimColor
+                color={FG.faint}
               >{`    ${t("ctxBreakdown.turnLabel")} ${String(tool.turn).padStart(3)}  `}</Text>
               <Text color={COLOR.info}>{tool.name.padEnd(22)}</Text>
-              <Text dimColor>{`  ${formatTokens(tool.tokens).padStart(8)}`}</Text>
+              <Text color={FG.faint}>{`  ${formatTokens(tool.tokens).padStart(8)}`}</Text>
+            </Box>
+          ))}
+        </Box>
+      ) : null}
+      {data.topToolSchemas.length > 0 ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text dim>{t("ctxBreakdown.topToolSchemas", { count: data.topToolSchemas.length })}</Text>
+          {data.topToolSchemas.map((tool) => (
+            <Box key={tool.name}>
+              <Text color={COLOR.info}>{`    ${tool.name.padEnd(28)}`}</Text>
+              <Text dim>{`  ${formatTokens(tool.tokens).padStart(8)}`}</Text>
             </Box>
           ))}
         </Box>
       ) : null}
       <Box marginTop={1}>
-        <Text dimColor>{t("ctxBreakdown.compactHint")}</Text>
+        <Text color={FG.faint}>{t("ctxBreakdown.compactHint")}</Text>
       </Box>
     </Box>
   );

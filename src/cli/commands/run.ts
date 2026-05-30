@@ -2,20 +2,23 @@ import type { WriteStream } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { createInterface } from "node:readline/promises";
 import {
+  bridgeEndpointEnv,
   defaultConfigPath,
   isPlausibleKey,
   loadApiKey,
-  loadBaseUrl,
-  mcpEnvFor,
+  loadEndpoint,
+  loadMaxIterPerTurn,
+  loadToolRateLimit,
+  normalizeMcpConfig,
   readConfig,
   saveApiKey,
 } from "../../config.js";
 import { loadDotenv } from "../../env.js";
+import { t } from "../../i18n/index.js";
 import { CacheFirstLoop, DeepSeekClient, ImmutablePrefix } from "../../index.js";
 import { McpClient } from "../../mcp/client.js";
 import { preflightStdioSpec } from "../../mcp/preflight.js";
 import { bridgeMcpTools } from "../../mcp/registry.js";
-import { parseMcpSpec } from "../../mcp/spec.js";
 import { buildTransportFromSpec } from "../../mcp/transport-from-spec.js";
 import { appendUsage } from "../../telemetry/usage.js";
 import { ToolRegistry } from "../../tools.js";
@@ -28,8 +31,6 @@ export interface RunOptions {
   model: string;
   system: string;
   budgetUsd?: number;
-  /** Per-turn repair-signal count required to escalate flash→pro. Undefined → loop default (3). */
-  failureThreshold?: number;
   /** JSONL transcript path — lets `reasonix replay` / `diff` audit this run. */
   transcript?: string;
   /** Zero or more MCP server specs. Each: `"name=cmd args..."` or `"cmd args..."`. */
@@ -43,10 +44,7 @@ async function ensureApiKey(): Promise<string> {
   if (existing) return existing;
 
   if (!stdin.isTTY) {
-    process.stderr.write(
-      "DEEPSEEK_API_KEY is not set and stdin is not a TTY (cannot prompt).\n" +
-        "Set the env var, or run `reasonix chat` once interactively to save a key.\n",
-    );
+    process.stderr.write(t("run.missingApiKey"));
     process.exit(1);
   }
 
@@ -73,25 +71,28 @@ async function ensureApiKey(): Promise<string> {
 
 export async function runCommand(opts: RunOptions): Promise<void> {
   loadDotenv();
-  const apiKey = await ensureApiKey();
-  process.env.DEEPSEEK_API_KEY = apiKey;
+  await ensureApiKey();
+  bridgeEndpointEnv();
 
   // Optional MCP setup — mirrors chat's flow. Must happen before loop
   // construction so the tools make it into the prefix.
-  const requestedSpecs = opts.mcp ?? [];
+  const cfg = readConfig();
+  const normalizedSpecs = normalizeMcpConfig(
+    cfg,
+    opts.mcp && opts.mcp.length > 0 ? opts.mcp : undefined,
+  );
   const clients: McpClient[] = [];
   let tools: ToolRegistry | undefined;
   let successCount = 0;
-  const disabledNames = new Set(readConfig().mcpDisabled ?? []);
-  if (requestedSpecs.length > 0) {
-    tools = new ToolRegistry();
-    for (const raw of requestedSpecs) {
+  const workspaceDir = process.cwd();
+  if (normalizedSpecs.length > 0) {
+    tools = new ToolRegistry({ rateLimit: loadToolRateLimit() });
+    for (const spec of normalizedSpecs) {
       let label = "anon";
       let mcp: McpClient | undefined;
       try {
-        const spec = parseMcpSpec(raw);
         label = spec.name ?? "anon";
-        if (spec.name && disabledNames.has(spec.name)) {
+        if (spec.disabled) {
           process.stderr.write(`${formatMcpLifecycleEvent({ state: "disabled", name: label })}\n`);
           continue;
         }
@@ -99,14 +100,12 @@ export async function runCommand(opts: RunOptions): Promise<void> {
         const t0 = Date.now();
         const prefix = spec.name
           ? `${spec.name}_`
-          : requestedSpecs.length === 1 && opts.mcpPrefix
+          : normalizedSpecs.length === 1 && opts.mcpPrefix
             ? opts.mcpPrefix
             : "";
-        if (spec.transport === "stdio") preflightStdioSpec(spec);
-        const transport = buildTransportFromSpec(spec, {
-          env: mcpEnvFor(spec.name, readConfig()),
-        });
-        mcp = new McpClient({ transport });
+        if (spec.transport === "stdio") preflightStdioSpec(spec, { cwd: workspaceDir });
+        const transport = buildTransportFromSpec(spec, { cwd: workspaceDir });
+        mcp = new McpClient({ transport, workspaceDir, requestTimeoutMs: spec.requestTimeoutMs });
         await mcp.initialize();
         const bridge = await bridgeMcpTools(mcp, {
           registry: tools,
@@ -134,14 +133,15 @@ export async function runCommand(opts: RunOptions): Promise<void> {
         // not even touch.
         await mcp?.close().catch(() => undefined);
         process.stderr.write(
-          `${formatMcpLifecycleEvent({ state: "failed", name: label, reason: (err as Error).message })}\n  → run \`reasonix setup\` to remove broken entries from your saved config.\n`,
+          `${formatMcpLifecycleEvent({ state: "failed", name: label, reason: (err as Error).message })}\n  ${t("mcpLifecycle.failedSetupConfigHint")}\n`,
         );
       }
     }
     if (successCount === 0) tools = undefined;
   }
 
-  const client = new DeepSeekClient({ baseUrl: loadBaseUrl() });
+  const ep = loadEndpoint();
+  const client = new DeepSeekClient({ apiKey: ep.apiKey, baseUrl: ep.baseUrl });
   const prefix = new ImmutablePrefix({
     system: opts.system,
     toolSpecs: tools?.specs(),
@@ -152,7 +152,7 @@ export async function runCommand(opts: RunOptions): Promise<void> {
     tools,
     model: opts.model,
     budgetUsd: opts.budgetUsd,
-    failureThreshold: opts.failureThreshold,
+    maxIterPerTurn: loadMaxIterPerTurn(),
   });
   const prefixHash = prefix.fingerprint;
 

@@ -16,6 +16,7 @@ import { isCommandAllowed } from "./shell/parse.js";
 export {
   BUILTIN_ALLOWLIST,
   detectShellOperator,
+  hasSensitivePathArgs,
   isAllowed,
   isCommandAllowed,
   isDqEscape,
@@ -46,6 +47,7 @@ export interface ShellToolsOptions {
   jobs?: JobRegistry;
   /** Fired after `run_background` / `stop_job` mutate the registry — used by the desktop popover for near-real-time updates without polling. */
   onJobsChanged?: () => void;
+  sensitivePaths?: { prefixes?: readonly string[]; patterns?: readonly string[] };
 }
 
 /** Error thrown by `run_command` when the command isn't allowlisted. */
@@ -85,7 +87,7 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
   registry.register({
     name: "run_command",
     description:
-      "Run a shell command in the project root; returns combined stdout+stderr. Allowlisted read-only / test / lint / typecheck commands run immediately; anything that could mutate state, install deps, or touch the network is gated by user confirmation. Prefer this over asking the user to run a command manually — after edits, run the project's tests to verify.\n\nConstraints (no real shell — argv is parsed natively for cross-platform parity):\n• Supported: chain ops `|` / `||` / `&&` / `;` (each segment allowlist-checked individually), file redirects `>` / `>>` / `<` / `2>` / `2>>` / `2>&1` / `&>` (target paths resolve relative to project root, max one redirect per fd per segment).\n• NOT supported: background `&`, heredoc `<<`, command substitution `$(…)`, subshells `(…)`, process substitution `<(…)`, `$VAR` env expansion, glob expansion. To pass an operator char as literal arg, quote it (`grep \"a|b\" file`).\n• `cd` does NOT persist — between calls OR within a chain like `cd dir && cmd`. Use the binary's own cwd flag: `npm --prefix <dir>`, `git -C <dir>`, `cargo -C <dir>`, `pytest <dir>/tests`.\n• Filter at source — unbounded output (`netstat -ano`, `find /`) wastes tokens. Use `grep -c`, `wc -l`, narrower paths, etc.",
+      'Run a shell command in the project root; returns combined stdout+stderr. Allowlisted read-only / test / lint / typecheck commands run immediately; mutating / network / install commands gate on user confirmation.\n\nDO NOT use run_command for file operations — use write_file, edit_file, multi_edit, copy_file, move_file, or delete_file instead. Shell utilities (echo, cp, sed, cat, tee, perl, python -c, etc.) bypass validation, lack rollback, and will trigger user confirmation gates that waste turns.\n\nNo real shell — argv parsed natively for cross-platform parity:\n• Supported: chains `|`/`||`/`&&`/`;` (each segment allowlist-checked) and file redirects `>`/`>>`/`<`/`2>`/`2>>`/`2>&1`/`&>`.\n• Rejected: background `&`, heredoc `<<`, `$(…)`, subshells, `$VAR` expansion, glob expansion. Quote operator chars as literals (`grep "a|b" file`).\n• `cd` is rejected in chains. By default, run generated scripts from the directory where the script was written; do not assume an input/data directory is the cwd. Pass input/data paths as arguments unless the command truly depends on that cwd. For package tools, use `npm --prefix <dir>`, `git -C <dir>`, `cargo -C <dir>`.\n• Filter at source — `grep -c` / `wc -l` / narrower paths over unbounded dumps.',
     // Plan-mode gate: allow allowlisted commands through (git status,
     // cargo check, ls, grep …) so the model can actually investigate
     // during planning. Anything that would otherwise trigger a
@@ -94,7 +96,7 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
       if (isAllowAll()) return true;
       const cmd = typeof args?.command === "string" ? args.command.trim() : "";
       if (!cmd) return false;
-      return isCommandAllowed(cmd, getExtraAllowed());
+      return isCommandAllowed(cmd, getExtraAllowed(), rootDir, opts.sensitivePaths);
     },
     parameters: {
       type: "object",
@@ -102,7 +104,7 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
         command: {
           type: "string",
           description:
-            'Full command line. POSIX-ish quoting. Chain operators `|`, `||`, `&&`, `;` and file redirects `>` / `>>` / `<` / `2>` / `2>>` / `2>&1` / `&>` work natively (no shell). Background `&`, heredoc `<<`, env-var expansion `$VAR`, and command substitution `$(…)` are rejected (or passed through as literal in the case of `$VAR`). To pass an operator character as a literal argument (e.g. a regex), wrap it in quotes: `grep "a|b" file.txt`.',
+            "Full command line. Quoting + chain/redirect rules per the top-level description.",
         },
         timeoutSec: {
           type: "integer",
@@ -115,7 +117,10 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
       const cmd = args.command.trim();
       if (!cmd) throw new Error("run_command: empty command");
       const effectiveTimeout = Math.max(1, Math.min(600, args.timeoutSec ?? timeoutSec));
-      if (!isAllowAll() && !isCommandAllowed(cmd, getExtraAllowed())) {
+      if (
+        !isAllowAll() &&
+        !isCommandAllowed(cmd, getExtraAllowed(), rootDir, opts.sensitivePaths)
+      ) {
         const gate = ctx?.confirmationGate ?? pauseGate;
         const choice = await gate.ask({
           kind: "run_command",
@@ -144,7 +149,7 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
   registry.register({
     name: "run_background",
     description:
-      "Spawn a long-running process and detach. Waits up to `waitSec` for startup or a readiness signal ('Local:', 'listening on', 'compiled successfully'), then returns the job id + startup preview. Tail logs with `job_output`, block on completion with `wait_for_job`, kill with `stop_job`, list with `list_jobs`.\n\nSingle process only — no chains / redirects. For subdirectories use the `cwd` parameter (workspace-relative or absolute, must stay inside the workspace root); do NOT write `cd X && cmd`, that gets rejected.\n\nUSE THIS — not run_command — for:\n- Dev servers / watchers: npm/yarn/pnpm dev, uvicorn / flask run, cargo watch, tsc --watch, webpack serve, anything with dev/serve/watch in the name.\n- One-shot long jobs: curl / wget large downloads, `huggingface-cli download`, multi-GB `pip install` / `npm install`, big `cargo build` / `docker build`. Start with `run_background`, then call `wait_for_job` once (default `waitFor: 'exit'`, timeoutMs up to 300_000) — the harness blocks server-side so a 5-minute download costs ONE tool call, not 30 polls.",
+      "Spawn a long-running process and detach. Waits up to `waitSec` for startup or a readiness signal ('Local:', 'listening on', 'compiled successfully'), then returns job id + startup preview. Companion tools: `job_output`, `wait_for_job`, `stop_job`, `list_jobs`. Single process only — no chains/redirects. Use `cwd` (not `cd X && cmd`) for subdirs.\n\nUSE THIS — not run_command — for: dev servers / watchers (`npm dev`, `uvicorn`, `tsc --watch`, anything with dev/serve/watch in the name) AND one-shot long jobs (large `curl`, `pip install`, `cargo build`, `docker build`). Pair with `wait_for_job` for server-side blocking — one tool call regardless of duration.",
     parameters: {
       type: "object",
       properties: {
@@ -170,7 +175,10 @@ export function registerShellTools(registry: ToolRegistry, opts: ShellToolsOptio
       const cmd = args.command.trim();
       if (!cmd) throw new Error("run_background: empty command");
       const cwd = resolveCwdInsideRoot(rootDir, args.cwd);
-      if (!isAllowAll() && !isCommandAllowed(cmd, getExtraAllowed())) {
+      if (
+        !isAllowAll() &&
+        !isCommandAllowed(cmd, getExtraAllowed(), rootDir, opts.sensitivePaths)
+      ) {
         const gate = ctx?.confirmationGate ?? pauseGate;
         const choice = await gate.ask({
           kind: "run_background",

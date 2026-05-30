@@ -1,10 +1,11 @@
-/** Encode-only DeepSeek V3 tokenizer port; ~3% drift vs API (chat-template framing not replayed). */
+/** Encode-only DeepSeek V4 tokenizer port. Applies V4 chat template so token count tracks API `prompt_tokens`. */
 
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
+import { LruCache } from "./core/lru.js";
 
 interface AddedToken {
   id: number;
@@ -151,6 +152,12 @@ function loadTokenizer(): LoadedTokenizer {
   return cached;
 }
 
+/** Force the BPE vocab to load now (gunzip + JSON.parse + Map build ≈ 100ms, 35MB heap).
+ *  Idempotent. Call once at idle after first paint so the first user turn doesn't pay it. */
+export function warmupTokenizer(): void {
+  loadTokenizer();
+}
+
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -178,15 +185,20 @@ function applySplit(chunks: string[], re: RegExp): string[] {
 /** UTF-8 bytes of `s`, each mapped to its byte-level visible char. */
 function byteLevelEncode(s: string, byteToChar: string[]): string {
   const bytes = new TextEncoder().encode(s);
-  let out = "";
-  for (let i = 0; i < bytes.length; i++) out += byteToChar[bytes[i]!];
-  return out;
+  const parts: string[] = new Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) parts[i] = byteToChar[bytes[i]!]!;
+  return parts.join("");
 }
+
+/** Repetitive tool output / identifier chunks re-encode thousands of times per session; LRU bounds at ~400KB. */
+const bpeCache = new LruCache<string, string[]>(8192);
 
 function bpeEncode(piece: string, mergeRank: Map<string, number>): string[] {
   if (piece.length <= 1) return piece ? [piece] : [];
-  let word: string[] = Array.from(piece);
-  while (true) {
+  const cached = bpeCache.get(piece);
+  if (cached !== undefined) return cached;
+  const word: string[] = Array.from(piece);
+  while (word.length > 1) {
     let bestIdx = -1;
     let bestRank = Number.POSITIVE_INFINITY;
     for (let i = 0; i < word.length - 1; i++) {
@@ -195,17 +207,13 @@ function bpeEncode(piece: string, mergeRank: Map<string, number>): string[] {
       if (rank !== undefined && rank < bestRank) {
         bestRank = rank;
         bestIdx = i;
-        if (rank === 0) break; // 0 is already the best possible
+        if (rank === 0) break;
       }
     }
     if (bestIdx < 0) break;
-    word = [
-      ...word.slice(0, bestIdx),
-      word[bestIdx]! + word[bestIdx + 1]!,
-      ...word.slice(bestIdx + 2),
-    ];
-    if (word.length === 1) break;
+    word.splice(bestIdx, 2, word[bestIdx]! + word[bestIdx + 1]!);
   }
+  bpeCache.set(piece, word);
   return word;
 }
 
@@ -251,36 +259,370 @@ export function encode(text: string): number[] {
 }
 
 export function countTokens(text: string): number {
-  return encode(text).length;
+  if (!text) return 0;
+  const t = loadTokenizer();
+  let count = 0;
+
+  const process = (segment: string) => {
+    if (!segment) return;
+    let chunks: string[] = [segment];
+    for (const re of t.splitRegexes) chunks = applySplit(chunks, re);
+    for (const chunk of chunks) {
+      if (!chunk) continue;
+      const byteLevel = byteLevelEncode(chunk, t.byteToChar);
+      const pieces = bpeEncode(byteLevel, t.mergeRank);
+      for (const p of pieces) {
+        if (t.vocab[p] !== undefined) count++;
+      }
+    }
+  };
+
+  if (t.addedPattern) {
+    t.addedPattern.lastIndex = 0;
+    let last = 0;
+    for (const m of text.matchAll(t.addedPattern)) {
+      const idx = m.index ?? 0;
+      if (idx > last) process(text.slice(last, idx));
+      if (t.addedMap.has(m[0])) count++;
+      last = idx + m[0].length;
+    }
+    if (last < text.length) process(text.slice(last));
+  } else {
+    process(text);
+  }
+  return count;
 }
 
-/** Doesn't add chat-template framing overhead; under-counts ~3-6% vs real `prompt_tokens`. */
-export function estimateConversationTokens(
-  messages: Array<{ content?: string | null; tool_calls?: unknown }>,
+export const DEFAULT_BOUNDED_TOKENIZE_CHARS = 2 * 1024;
+
+export function countTokensBounded(
+  text: string,
+  maxChars = DEFAULT_BOUNDED_TOKENIZE_CHARS,
 ): number {
-  let total = 0;
-  for (const m of messages) {
-    if (typeof m.content === "string" && m.content) {
-      total += countTokens(m.content);
+  if (text.length === 0) return 0;
+  const cap = Math.floor(maxChars);
+  if (cap > 0 && text.length <= cap) return countTokens(text);
+  if (cap <= 0) return Math.max(1, Math.ceil(text.length * 0.3));
+
+  const headChars = Math.ceil(cap / 2);
+  const tailChars = Math.floor(cap / 2);
+  const head = text.slice(0, headChars);
+  const tail = tailChars > 0 ? text.slice(-tailChars) : "";
+  const sampleChars = head.length + tail.length;
+  const sampleTokens = countTokens(head) + countTokens(tail);
+  const ratio = sampleChars > 0 ? sampleTokens / sampleChars : 0.3;
+  return Math.max(1, Math.ceil(text.length * ratio));
+}
+
+const BOS = "<｜begin▁of▁sentence｜>";
+const EOS = "<｜end▁of▁sentence｜>";
+const USER_SP = "<｜User｜>";
+const ASSISTANT_SP = "<｜Assistant｜>";
+const THINK_START = "<think>";
+const THINK_END = "</think>";
+
+const DSML = "｜DSML｜";
+const TC_BEGIN = `<${DSML}tool_calls>`;
+const TC_END = `</${DSML}tool_calls>`;
+const INVOKE_BEGIN = `<${DSML}invoke name="`;
+const INVOKE_END = `</${DSML}invoke>`;
+const PARAM_TEMPLATE = `<${DSML}parameter name="{key}" string="{is_str}">{value}</${DSML}parameter>`;
+const TOOL_RESULT_TEMPLATE = "<tool_result>{content}</tool_result>";
+
+/** Keyed by `ImmutablePrefix._toolSpecs` identity — stable for the prefix's lifetime. */
+const toolsTemplateCache = new WeakMap<ReadonlyArray<unknown>, string>();
+
+function renderTools(tools: ReadonlyArray<unknown>): string {
+  const cached = toolsTemplateCache.get(tools);
+  if (cached !== undefined) return cached;
+
+  const schemas = tools
+    .map((t) => {
+      const fn = (t as { function?: unknown }).function ?? t;
+      return JSON.stringify(fn);
+    })
+    .join("\n");
+  const rendered = `## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<${DSML}tool_calls>" block like the following:\n\n<${DSML}tool_calls>\n<${DSML}invoke name="$TOOL_NAME">\n<${DSML}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</${DSML}parameter>\n...\n</${DSML}invoke>\n<${DSML}invoke name="$TOOL_NAME2">\n...\n</${DSML}invoke>\n</${DSML}tool_calls>\n\nString parameters should be specified as is and set \`string="true"\`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set \`string="false"\`.\n\nIf thinking_mode is enabled (triggered by ${THINK_START}), you MUST output your complete reasoning inside ${THINK_START}...${THINK_END} BEFORE any tool calls or final response.\n\nOtherwise, output directly after ${THINK_END} with tool calls or final response.\n\n### Available Tool Schemas\n\n${schemas}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.`;
+
+  toolsTemplateCache.set(tools, rendered);
+  return rendered;
+}
+
+interface ToolCall {
+  function?: { name?: string; arguments?: string };
+  [k: string]: unknown;
+}
+
+interface V4Message {
+  role?: string;
+  content?: string | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  reasoning_content?: string | null;
+  _toolBlocks?: string[];
+  _textParts?: string[];
+}
+
+function encodeArgumentsToDsml(argsJson: string): string {
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(argsJson) as Record<string, unknown>;
+  } catch {
+    args = { arguments: argsJson };
+  }
+  return Object.entries(args)
+    .map(([k, v]) =>
+      PARAM_TEMPLATE.replace("{key}", k)
+        .replace("{is_str}", typeof v === "string" ? "true" : "false")
+        .replace("{value}", typeof v === "string" ? v : JSON.stringify(v)),
+    )
+    .join("\n");
+}
+
+function renderToolCallsDsml(toolCalls: ToolCall[]): string {
+  const invokes = toolCalls
+    .map((tc) => {
+      const name = tc.function?.name ?? "";
+      const argsJson = tc.function?.arguments ?? "{}";
+      return `${INVOKE_BEGIN + name}">\n${encodeArgumentsToDsml(argsJson)}\n${INVOKE_END}`;
+    })
+    .join("\n");
+  return `\n\n${TC_BEGIN}\n${invokes}\n${TC_END}`;
+}
+
+function mergeToolMessages(messages: V4Message[]): V4Message[] {
+  const merged: V4Message[] = [];
+  for (const msg of messages) {
+    const role = msg.role ?? "user";
+    if (role === "tool") {
+      const toolBlock = TOOL_RESULT_TEMPLATE.replace("{content}", msg.content ?? "");
+      const last = merged[merged.length - 1];
+      if (
+        last &&
+        last.role === "user" &&
+        Array.isArray(last._toolBlocks) &&
+        Array.isArray(last._textParts)
+      ) {
+        last._toolBlocks.push(toolBlock);
+        last.content = `${last._textParts.join("\n\n")}\n\n${last._toolBlocks.join("\n")}`.replace(
+          /^\n\n/,
+          "",
+        );
+      } else {
+        merged.push({
+          role: "user",
+          content: toolBlock,
+          _textParts: [],
+          _toolBlocks: [toolBlock],
+        });
+      }
+    } else if (role === "user") {
+      const text = msg.content ?? "";
+      const last = merged[merged.length - 1];
+      if (
+        last &&
+        last.role === "user" &&
+        Array.isArray(last._toolBlocks) &&
+        Array.isArray(last._textParts)
+      ) {
+        last._textParts.push(text);
+        last.content =
+          `${last._textParts.join("\n\n")}\n\n${last._toolBlocks.join("\n\n")}`.replace(
+            /^\n\n/,
+            "",
+          );
+      } else {
+        merged.push({
+          ...msg,
+          role: "user",
+          content: text,
+          _textParts: [text],
+          _toolBlocks: [],
+        });
+      }
+    } else {
+      merged.push({ ...msg });
     }
-    // Tool-call arguments are serialized as JSON in the prompt by the
-    // chat template; their bytes WILL count upstream, so we count
-    // them too. Stringify-once is cheap relative to the tokenize.
-    if (m.tool_calls && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-      total += countTokens(JSON.stringify(m.tool_calls));
+  }
+  for (const m of merged) {
+    m._textParts = undefined;
+    m._toolBlocks = undefined;
+  }
+  return merged;
+}
+
+/** Drop `reasoning_content` from assistant messages before the last user/developer message. Matches Python `_drop_thinking_messages`. */
+function dropThinkingMessages(messages: V4Message[]): V4Message[] {
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const role = messages[i]!.role;
+    if (role === "user" || role === "developer") {
+      lastUserIdx = i;
+      break;
     }
+  }
+  if (lastUserIdx < 0) return messages;
+
+  // Match Python `_drop_thinking_messages`:
+  //   - developer messages before lastUserIdx are dropped entirely
+  //   - assistant messages before lastUserIdx keep content & tool_calls
+  //     but have reasoning_content stripped
+  const result: V4Message[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+    if (i < lastUserIdx && msg.role === "developer") continue;
+    if (i < lastUserIdx && msg.role === "assistant") {
+      result.push({ ...msg, reasoning_content: null });
+    } else {
+      result.push(msg);
+    }
+  }
+  return result;
+}
+
+/** Apply DeepSeek V4 chat template. Matches `encoding_dsv4.py`: tool results merged into user messages, assistant tool_calls in DSML, generation suffix appended. */
+export function formatDeepSeekPrompt(
+  messages: Array<{
+    role?: string;
+    content?: string | null;
+    tool_calls?: unknown;
+    tool_call_id?: string;
+    reasoning_content?: string | null;
+  }>,
+  drop_thinking = false,
+): string {
+  if (messages.length === 0) return ASSISTANT_SP + THINK_END;
+
+  let msgs = messages as V4Message[];
+  if (drop_thinking) {
+    msgs = dropThinkingMessages(msgs);
+  }
+  const merged = mergeToolMessages(msgs);
+
+  const parts: string[] = [BOS];
+
+  for (let i = 0; i < merged.length; i++) {
+    const msg = merged[i]!;
+    const role = msg.role ?? "user";
+    const nextRole = i + 1 < merged.length ? (merged[i + 1]!.role ?? "user") : null;
+
+    if (role === "system") {
+      parts.push(msg.content ?? "");
+    } else if (role === "user") {
+      parts.push(USER_SP, msg.content ?? "");
+      if (nextRole === "assistant" || nextRole === null) {
+        parts.push(ASSISTANT_SP, THINK_END);
+      }
+    } else if (role === "assistant") {
+      if (msg.reasoning_content) {
+        parts.push(THINK_START, msg.reasoning_content, THINK_END);
+      }
+      if (msg.content) parts.push(msg.content);
+      const tcs = msg.tool_calls;
+      if (Array.isArray(tcs) && tcs.length > 0) {
+        parts.push(renderToolCallsDsml(tcs));
+      }
+      parts.push(EOS);
+    }
+  }
+
+  return parts.join("");
+}
+
+const PER_MESSAGE_TEMPLATE_TOKENS = 6;
+
+/** Keyed by content string — WeakMap-on-message can't be used because callers spread `{...e}` defensive copies, breaking identity every turn. */
+const contentTokenCache = new LruCache<string, number>(4096);
+
+/** Skip caching strings >10KB — 4096 entries of 50KB+ tool outputs would retain 200MB+ of string keys. */
+const MAX_CACHEABLE_CHARS = 10 * 1024;
+
+function cachedBoundedTokens(s: string): number {
+  if (s.length === 0) return 0;
+  const cached = contentTokenCache.get(s);
+  if (cached !== undefined) return cached;
+  const n = countTokensBounded(s);
+  if (s.length <= MAX_CACHEABLE_CHARS) contentTokenCache.set(s, n);
+  return n;
+}
+
+function tokensForMessage(
+  m: {
+    role?: string;
+    content?: string | null;
+    tool_calls?: unknown;
+    reasoning_content?: string | null;
+  },
+  dropThisReasoning: boolean,
+): number {
+  let n = 0;
+  if (typeof m.content === "string" && m.content.length > 0) {
+    n += cachedBoundedTokens(m.content);
+  }
+  if (m.role === "assistant") {
+    if (
+      !dropThisReasoning &&
+      typeof m.reasoning_content === "string" &&
+      m.reasoning_content.length > 0
+    ) {
+      n += cachedBoundedTokens(m.reasoning_content);
+    }
+    const tcs = m.tool_calls;
+    if (Array.isArray(tcs) && tcs.length > 0) {
+      n += cachedBoundedTokens(JSON.stringify(tcs));
+    }
+  }
+  return n;
+}
+
+/** Per-message bounded sum, not a full-prompt rebuild — used for fold-threshold checks where ±5% slop is fine. */
+export function estimateConversationTokens(
+  messages: Array<{
+    role?: string;
+    content?: string | null;
+    tool_calls?: unknown;
+    tool_call_id?: string;
+    reasoning_content?: string | null;
+  }>,
+  drop_thinking = false,
+): number {
+  if (messages.length === 0) return 0;
+  let lastUserOrDev = -1;
+  if (drop_thinking) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const r = messages[i]!.role;
+      if (r === "user" || r === "developer") {
+        lastUserOrDev = i;
+        break;
+      }
+    }
+  }
+  let total = 2;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]!;
+    if (drop_thinking && i < lastUserOrDev && m.role === "developer") continue;
+    total += PER_MESSAGE_TEMPLATE_TOKENS;
+    const dropReasoning = drop_thinking && i < lastUserOrDev && m.role === "assistant";
+    total += tokensForMessage(m, dropReasoning);
   }
   return total;
 }
 
-/** Tool specs ride in a separate request blob; must be counted separately for an accurate preflight. */
+/** Total request tokens (messages + tool specs) as the API counts them. Tool specs rendered via V4 TOOLS_TEMPLATE and added to message token count. */
 export function estimateRequestTokens(
-  messages: Array<{ content?: string | null; tool_calls?: unknown }>,
+  messages: Array<{
+    role?: string;
+    content?: string | null;
+    tool_calls?: unknown;
+    tool_call_id?: string;
+    reasoning_content?: string | null;
+  }>,
   toolSpecs?: ReadonlyArray<unknown> | null,
+  drop_thinking = false,
 ): number {
-  let total = estimateConversationTokens(messages);
+  let total = estimateConversationTokens(messages, drop_thinking);
   if (toolSpecs && toolSpecs.length > 0) {
-    total += countTokens(JSON.stringify(toolSpecs));
+    total += countTokensBounded(renderTools(toolSpecs));
   }
   return total;
 }

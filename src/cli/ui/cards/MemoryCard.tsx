@@ -1,4 +1,4 @@
-import { Box, Text } from "ink";
+import { Box, type Color, Text } from "ink";
 // biome-ignore lint/style/useImportType: tsconfig jsx=react needs React in value scope for JSX compilation
 import React from "react";
 import { t } from "../../../i18n/index.js";
@@ -28,13 +28,13 @@ function categoryLabel(c: MemoryEntry["category"]): string {
 }
 
 const CATEGORY_GLYPH: Record<MemoryEntry["category"], string> = {
-  user: "◇",
-  feedback: "✦",
-  project: "◇",
-  reference: "→",
+  user: "●",
+  feedback: "●",
+  project: "●",
+  reference: "●",
 };
 
-const CATEGORY_GLYPH_COLOR: Record<MemoryEntry["category"], string> = {
+const CATEGORY_GLYPH_COLOR: Record<MemoryEntry["category"], Color> = {
   user: FG.meta,
   feedback: TONE.warn,
   project: FG.meta,
@@ -53,10 +53,9 @@ export function MemoryCard({ card }: { card: MemoryCardData }): React.ReactEleme
   return (
     <Card tone={FG.meta}>
       <CardHeader
-        glyph="⌑"
+        glyph="●"
         tone={FG.meta}
         title={t("cardTitles.context")}
-        titleColor={FG.sub}
         meta={summary ? [summary, tokens] : [tokens]}
       />
       {CATEGORY_ORDER.filter((c) => counts[c] > 0).map((category) => {

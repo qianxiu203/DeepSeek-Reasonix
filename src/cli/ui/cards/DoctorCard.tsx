@@ -1,4 +1,4 @@
-import { Box, Text } from "ink";
+import { Box, type Color, Text } from "ink";
 // biome-ignore lint/style/useImportType: tsconfig jsx=react needs React in value scope for JSX compilation
 import React from "react";
 import { t } from "../../../i18n/index.js";
@@ -11,7 +11,7 @@ import { CARD } from "../theme/tokens.js";
 const LEVEL_GLYPH: Record<DoctorCheckEntry["level"], string> = {
   ok: "✓",
   warn: "⚠",
-  fail: "✖",
+  fail: "✗",
 };
 
 function levelTag(level: DoctorCheckEntry["level"]): string {
@@ -27,7 +27,7 @@ function levelTag(level: DoctorCheckEntry["level"]): string {
 
 export function DoctorCard({ card }: { card: DoctorCardData }): React.ReactElement {
   const { fg, tone } = useThemeTokens();
-  const levelColor: Record<DoctorCheckEntry["level"], string> = {
+  const levelColor: Record<DoctorCheckEntry["level"], Color> = {
     ok: tone.ok,
     warn: tone.warn,
     fail: tone.err,
@@ -41,7 +41,7 @@ export function DoctorCard({ card }: { card: DoctorCardData }): React.ReactEleme
   return (
     <Card tone={CARD.tool.color}>
       <CardHeader
-        glyph="⚕"
+        glyph="●"
         tone={CARD.tool.color}
         title={t("cardTitles.doctor")}
         meta={[summary]}

@@ -4,6 +4,9 @@ import React from "react";
 import { t } from "../../i18n/index.js";
 import type { SlashCommandSpec } from "./slash.js";
 import { GLYPH, useColor } from "./theme.js";
+import { type ThemeChoice, themeChoiceLabel } from "./theme/labels.js";
+import { FG, SURFACE } from "./theme/tokens.js";
+import type { AtPickerEntry } from "./useCompletionPickers.js";
 
 export interface SlashArgPickerProps {
   /**
@@ -24,6 +27,11 @@ export interface SlashArgPickerProps {
   kind: "picker" | "hint";
   /** The user's partial input — shown in the "no matches" hint. */
   partial: string;
+  /**
+   * When the completer is `"path"`, carries the rich entries (with `isDir`)
+   * so the picker can render a trailing `/` on directories.
+   */
+  pathCandidates?: readonly AtPickerEntry[] | null;
 }
 
 /**
@@ -37,8 +45,19 @@ export function SlashArgPicker({
   spec,
   kind,
   partial,
+  pathCandidates,
 }: SlashArgPickerProps): React.ReactElement | null {
   const color = useColor();
+  const headerArgsHint = (() => {
+    const argsKey = `slash.${spec.cmd}.argsHint`;
+    const translatedArgs = t(argsKey);
+    return translatedArgs === argsKey ? (spec.argsHint ?? "") : translatedArgs;
+  })();
+  const headerSummary = (() => {
+    const descKey = `slash.${spec.cmd}.description`;
+    const translated = t(descKey);
+    return translated === descKey ? spec.summary : translated;
+  })();
   const headerRow = (
     <Box>
       <Text color={color.accent} bold>
@@ -47,8 +66,8 @@ export function SlashArgPicker({
       <Text color={color.accent} bold>
         {`/${spec.cmd}`}
       </Text>
-      {spec.argsHint ? <Text dimColor>{` ${spec.argsHint}`}</Text> : null}
-      <Text dimColor>{`  ${spec.summary}`}</Text>
+      {headerArgsHint ? <Text color={FG.faint}>{` ${headerArgsHint}`}</Text> : null}
+      <Text color={FG.faint}>{`  ${headerSummary}`}</Text>
     </Box>
   );
 
@@ -70,7 +89,7 @@ export function SlashArgPicker({
             {GLYPH.warn}
           </Text>
           <Text color={color.warn}>{t("slashArgPicker.noMatch", { partial })}</Text>
-          <Text dimColor>{t("slashArgPicker.keepTyping")}</Text>
+          <Text color={FG.faint}>{t("slashArgPicker.keepTyping")}</Text>
         </Box>
       </Box>
     );
@@ -87,31 +106,45 @@ export function SlashArgPicker({
     <Box flexDirection="column" paddingX={1} marginTop={1}>
       {headerRow}
       {hiddenAbove > 0 ? (
-        <Text dimColor>{t("slashArgPicker.above", { hidden: hiddenAbove })}</Text>
+        <Text color={FG.faint}>{t("slashArgPicker.above", { hidden: hiddenAbove })}</Text>
       ) : null}
-      {shown.map((value, i) => (
-        <ArgRow key={value} value={value} isSelected={windowStart + i === selectedIndex} />
-      ))}
+      {shown.map((value, i) => {
+        const idx = windowStart + i;
+        const isDir = pathCandidates?.[idx]?.isDir ?? false;
+        const label = spec.cmd === "theme" ? themeChoiceLabel(value as ThemeChoice) : value;
+        return (
+          <ArgRow key={value} value={label} isSelected={idx === selectedIndex} isDir={isDir} />
+        );
+      })}
       {hiddenBelow > 0 ? (
-        <Text dimColor>{t("slashArgPicker.below", { hidden: hiddenBelow })}</Text>
+        <Text color={FG.faint}>{t("slashArgPicker.below", { hidden: hiddenBelow })}</Text>
       ) : null}
       <Box marginTop={0}>
-        <Text dimColor>{t("slashArgPicker.footer")}</Text>
+        <Text color={FG.faint}>{t("slashArgPicker.footer")}</Text>
       </Box>
     </Box>
   );
 }
 
-function ArgRow({ value, isSelected }: { value: string; isSelected: boolean }) {
+function ArgRow({
+  value,
+  isSelected,
+  isDir,
+}: {
+  value: string;
+  isSelected: boolean;
+  isDir: boolean;
+}) {
   const color = useColor();
   return (
-    <Box>
+    <Box backgroundColor={isSelected ? SURFACE.bgElev : undefined}>
       <Text color={isSelected ? color.primary : color.info} bold={isSelected}>
         {isSelected ? `${GLYPH.cur} ` : "  "}
       </Text>
-      <Text color={isSelected ? color.user : color.info} bold={isSelected} dimColor={!isSelected}>
+      <Text color={isSelected ? color.user : FG.faint} bold={isSelected}>
         {value}
       </Text>
+      {isDir ? <Text color={FG.faint}>/</Text> : null}
     </Box>
   );
 }

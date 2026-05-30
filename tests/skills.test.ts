@@ -1,14 +1,14 @@
 /** Skills store + prefix-index composer — temp homeDir / projectRoot per test, no real skill dirs touched. */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { join, resolve } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SkillStore, applySkillsIndex, validateSkillFrontmatter } from "../src/skills.js";
 
 const BASE = "You are a test assistant.";
 
-type SkillRoot = "project" | "global";
+type SkillRoot = "project" | "global" | "custom";
 
 function writeSkillDir(
   root: string,
@@ -21,7 +21,9 @@ function writeSkillDir(
   const parent =
     which === "global"
       ? join(homeOrProject, ".reasonix", "skills")
-      : join(root, ".reasonix", "skills");
+      : which === "project"
+        ? join(root, ".reasonix", "skills")
+        : homeOrProject;
   const dir = join(parent, name);
   mkdirSync(dir, { recursive: true });
   const fmLines = ["---"];
@@ -112,6 +114,91 @@ describe("SkillStore", () => {
     expect(list[0]?.path).toContain(projectRoot);
   });
 
+  it("discovers .agents/skills as a default root (#870) — both project and global", () => {
+    const projParent = join(projectRoot, ".agents", "skills");
+    mkdirSync(projParent, { recursive: true });
+    const projPath = join(projParent, "deploy", "SKILL.md");
+    mkdirSync(join(projParent, "deploy"));
+    writeFileSync(projPath, "---\ndescription: from .agents\n---\nbody\n", "utf8");
+
+    const globParent = join(home, ".agents", "skills");
+    mkdirSync(globParent, { recursive: true });
+    const globPath = join(globParent, "review", "SKILL.md");
+    mkdirSync(join(globParent, "review"));
+    writeFileSync(globPath, "---\ndescription: glob agents\n---\nbody\n", "utf8");
+
+    const store = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true });
+    const names = store.list().map((s) => s.name);
+    expect(names).toContain("deploy");
+    expect(names).toContain("review");
+  });
+
+  // Skipped on Windows — file symlink creation also requires Developer Mode / admin.
+  it.skipIf(process.platform === "win32")("follows symlinked flat <name>.md skill files", () => {
+    const realRoot = mkdtempSync(join(tmpdir(), "reasonix-skills-real-md-"));
+    try {
+      const realFile = join(realRoot, "shipit.md");
+      writeFileSync(realFile, "---\ndescription: flat via symlink\n---\nbody\n", "utf8");
+      const scannedRoot = join(home, ".reasonix", "skills");
+      mkdirSync(scannedRoot, { recursive: true });
+      symlinkSync(realFile, join(scannedRoot, "shipit.md"), "file");
+
+      const skills = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true }).list();
+      expect(skills.map((s) => s.name)).toContain("shipit");
+    } finally {
+      rmSync(realRoot, { recursive: true, force: true });
+    }
+  });
+
+  // Skipped on Windows — symlinkSync to a nonexistent target throws EPERM there without
+  // Developer Mode / admin, unrelated to the readEntry behavior under test.
+  it.skipIf(process.platform === "win32")(
+    "silently skips a broken symlink instead of crashing the scan",
+    () => {
+      const scannedRoot = join(home, ".reasonix", "skills");
+      mkdirSync(scannedRoot, { recursive: true });
+      symlinkSync(
+        join(tmpdir(), "reasonix-skills-nonexistent-target"),
+        join(scannedRoot, "broken"),
+      );
+      writeSkillDir(projectRoot, "global", "good", { description: "real one" }, "body", home);
+
+      const skills = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true }).list();
+      // The broken symlink is dropped, but the sibling real skill still shows up.
+      expect(skills.map((s) => s.name)).toEqual(["good"]);
+    },
+  );
+
+  it("inlines references/ files into body at load time (#2214 — Anthropic Skills spec)", () => {
+    const skillDir = join(home, ".reasonix", "skills", "deep-expert");
+    const refsDir = join(skillDir, "references");
+    mkdirSync(refsDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      "---\ndescription: an expert skill\n---\nCore playbook.\n",
+      "utf8",
+    );
+    writeFileSync(join(refsDir, "methodology.md"), "# Methodology\nBe systematic.", "utf8");
+    writeFileSync(join(refsDir, "examples.md"), "# Examples\nCase 1.", "utf8");
+
+    const skills = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true }).list();
+    const skill = skills.find((s) => s.name === "deep-expert");
+    expect(skill).toBeDefined();
+    expect(skill?.body).toContain("Core playbook.");
+    expect(skill?.body).toContain("## Reference: methodology");
+    expect(skill?.body).toContain("Be systematic.");
+    expect(skill?.body).toContain("## Reference: examples");
+    expect(skill?.body).toContain("Case 1.");
+  });
+
+  it("flat <name>.md skills are unaffected by references/ loading (#2214)", () => {
+    writeFlatSkill(home, "flat-skill", { description: "flat skill" }, "flat body");
+    // Even if a references/ dir exists elsewhere, flat skills should not touch it.
+    const skills = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true }).list();
+    const skill = skills.find((s) => s.name === "flat-skill");
+    expect(skill?.body).toBe("flat body");
+  });
+
   it("project scope wins on a name collision with global", () => {
     writeSkillDir(projectRoot, "global", "review", { description: "global one" }, "G", home);
     writeSkillDir(projectRoot, "project", "review", { description: "project one" }, "P", home);
@@ -146,6 +233,171 @@ describe("SkillStore", () => {
     writeFileSync(join(dotDir, ".hidden.md"), "---\ndescription: x\n---\nbody\n", "utf8");
     const list = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true }).list();
     expect(list.map((s) => s.name)).toEqual(["ok"]);
+  });
+
+  it("reads custom flat and dir-layout skills directly from configured roots", () => {
+    const custom = mkdtempSync(join(tmpdir(), "reasonix-skills-custom-"));
+    try {
+      writeSkillDir(
+        projectRoot,
+        "custom",
+        "custom-dir",
+        { description: "custom dir" },
+        "D",
+        custom,
+      );
+      const flatPath = join(custom, "custom-flat.md");
+      writeFileSync(flatPath, "---\ndescription: custom flat\n---\nF\n", "utf8");
+      const list = new SkillStore({
+        homeDir: home,
+        projectRoot,
+        customSkillPaths: [custom],
+        disableBuiltins: true,
+      }).list();
+      expect(list.map((s) => `${s.scope}:${s.name}`)).toEqual([
+        "custom:custom-dir",
+        "custom:custom-flat",
+      ]);
+      expect(list.find((s) => s.name === "custom-flat")?.path).toBe(flatPath);
+    } finally {
+      rmSync(custom, { recursive: true, force: true });
+    }
+  });
+
+  it("deduplicates custom roots and preserves first priority", () => {
+    const custom = mkdtempSync(join(tmpdir(), "reasonix-skills-custom-"));
+    try {
+      const roots = new SkillStore({
+        homeDir: home,
+        projectRoot,
+        customSkillPaths: [custom, custom],
+        disableBuiltins: true,
+      }).customRoots();
+      expect(roots.map((r) => r.dir)).toEqual([custom]);
+    } finally {
+      rmSync(custom, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves relative custom roots against projectRoot for discovery", () => {
+    const relativeRoot = "skills-local";
+    const custom = join(projectRoot, relativeRoot);
+    writeSkillDir(projectRoot, "custom", "local-skill", { description: "local" }, "L", custom);
+    const store = new SkillStore({
+      homeDir: home,
+      projectRoot,
+      customSkillPaths: [relativeRoot, custom],
+      disableBuiltins: true,
+    });
+    expect(store.customRoots().map((r) => r.dir)).toEqual([resolve(projectRoot, relativeRoot)]);
+    expect(store.list().map((s) => s.name)).toEqual(["local-skill"]);
+  });
+
+  it("keeps priority project > custom > global on same-name collisions", () => {
+    const custom = mkdtempSync(join(tmpdir(), "reasonix-skills-custom-"));
+    try {
+      writeSkillDir(projectRoot, "global", "same", { description: "global" }, "G", home);
+      writeSkillDir(projectRoot, "custom", "same", { description: "custom" }, "C", custom);
+      const customWinner = new SkillStore({
+        homeDir: home,
+        projectRoot,
+        customSkillPaths: [custom],
+        disableBuiltins: true,
+      }).read("same");
+      expect(customWinner?.scope).toBe("custom");
+      writeSkillDir(projectRoot, "project", "same", { description: "project" }, "P", home);
+      const projectWinner = new SkillStore({
+        homeDir: home,
+        projectRoot,
+        customSkillPaths: [custom],
+        disableBuiltins: true,
+      }).read("same");
+      expect(projectWinner?.scope).toBe("project");
+    } finally {
+      rmSync(custom, { recursive: true, force: true });
+    }
+  });
+
+  it("reports invalid custom root status without throwing", () => {
+    const missing = join(projectRoot, "missing-skills");
+    const notDir = join(projectRoot, "file.txt");
+    writeFileSync(notDir, "x", "utf8");
+    const store = new SkillStore({
+      homeDir: home,
+      projectRoot,
+      customSkillPaths: [missing, notDir],
+      disableBuiltins: true,
+    });
+    expect(store.list()).toEqual([]);
+    expect(store.customRoots().map((r) => r.status)).toEqual(["missing", "not-directory"]);
+  });
+
+  describe("subagentModels override", () => {
+    it("applies flash/pro override onto builtin subagent skills", () => {
+      const store = new SkillStore({
+        homeDir: home,
+        projectRoot,
+        subagentModels: { explore: "pro", review: "flash" },
+      });
+      const byName = new Map(store.list().map((s) => [s.name, s]));
+      expect(byName.get("explore")?.model).toBe("deepseek-v4-pro");
+      expect(byName.get("review")?.model).toBe("deepseek-v4-flash");
+    });
+
+    it("leaves inline skills (test) untouched even when their name appears in the override map", () => {
+      const store = new SkillStore({
+        homeDir: home,
+        projectRoot,
+        // `test` is shipped runAs=inline — overrides must not apply to inline skills.
+        subagentModels: { test: "pro" },
+      });
+      const test = store.list().find((s) => s.name === "test");
+      expect(test?.runAs).toBe("inline");
+      expect(test?.model).toBeUndefined();
+    });
+
+    it("no override → frontmatter model: still wins (no regression)", () => {
+      writeSkillDir(
+        projectRoot,
+        "project",
+        "custom-sub",
+        {
+          name: "custom-sub",
+          description: "custom subagent skill",
+          runAs: "subagent",
+          model: "deepseek-v4-pro",
+        },
+        "body",
+        home,
+      );
+      const store = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true });
+      const sub = store.list().find((s) => s.name === "custom-sub");
+      expect(sub?.model).toBe("deepseek-v4-pro");
+    });
+
+    it("override beats frontmatter model: when both are set", () => {
+      writeSkillDir(
+        projectRoot,
+        "project",
+        "custom-sub",
+        {
+          name: "custom-sub",
+          description: "custom subagent skill",
+          runAs: "subagent",
+          model: "deepseek-v4-pro",
+        },
+        "body",
+        home,
+      );
+      const store = new SkillStore({
+        homeDir: home,
+        projectRoot,
+        disableBuiltins: true,
+        subagentModels: { "custom-sub": "flash" },
+      });
+      const sub = store.list().find((s) => s.name === "custom-sub");
+      expect(sub?.model).toBe("deepseek-v4-flash");
+    });
   });
 
   describe("create() — /skill new scaffold (#366)", () => {
@@ -185,6 +437,43 @@ describe("SkillStore", () => {
       const r = store.create("nope", "project");
       expect("error" in r).toBe(true);
     });
+  });
+
+  // Skipped on Windows — symlinkSync throws EPERM there without Developer Mode / admin,
+  // unrelated to the readEntry behavior under test.
+  it.skipIf(process.platform === "win32")("loads skills from symlinked directories (#2104)", () => {
+    // Create a real skill directory outside the skills root
+    const realDir = mkdtempSync(join(tmpdir(), "reasonix-skills-real-"));
+    try {
+      writeFileSync(
+        join(realDir, "SKILL.md"),
+        "---\ndescription: symlinked skill\n---\nSymlinked body\n",
+        "utf8",
+      );
+      // Create a symlink to it inside the global skills dir
+      const skillsDir = join(home, ".reasonix", "skills");
+      mkdirSync(skillsDir, { recursive: true });
+      symlinkSync(realDir, join(skillsDir, "linked-skill"));
+
+      const store = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true });
+      const skills = store.list();
+      expect(skills).toHaveLength(1);
+      expect(skills[0]?.name).toBe("linked-skill");
+      expect(skills[0]?.description).toBe("symlinked skill");
+      expect(skills[0]?.body).toBe("Symlinked body");
+    } finally {
+      rmSync(realDir, { recursive: true, force: true });
+    }
+  });
+
+  // Skipped on Windows — symlinkSync to a nonexistent target throws EPERM without admin.
+  it.skipIf(process.platform === "win32")("skips broken symlinks gracefully", () => {
+    const skillsDir = join(home, ".reasonix", "skills");
+    mkdirSync(skillsDir, { recursive: true });
+    symlinkSync(join(tmpdir(), `nonexistent-target-${Date.now()}`), join(skillsDir, "broken"));
+
+    const store = new SkillStore({ homeDir: home, projectRoot, disableBuiltins: true });
+    expect(store.list()).toEqual([]);
   });
 });
 
@@ -398,56 +687,86 @@ describe("Skill frontmatter — runAs", () => {
     expect(store.read("empty")?.allowedTools).toBeUndefined();
   });
 
-  it("parses max-iters and passes it through as maxToolIters", () => {
-    writeSkillDir(
-      home,
-      "global",
-      "big",
-      { description: "...", runAs: "subagent", "max-iters": "32" },
-      "body",
-      home,
-    );
-    const store = new SkillStore({ homeDir: home, disableBuiltins: true });
-    expect(store.read("big")?.maxToolIters).toBe(32);
-  });
+  describe("Claude SKILL.md aliases", () => {
+    function writeClaudeSkill(
+      base: string,
+      where: "global" | "project",
+      name: string,
+      frontmatter: Record<string, string>,
+      body: string,
+    ): void {
+      const parent =
+        where === "global" ? join(base, ".claude", "skills") : join(base, ".claude", "skills");
+      const dir = join(parent, name);
+      mkdirSync(dir, { recursive: true });
+      const fmLines = ["---"];
+      for (const [k, v] of Object.entries(frontmatter)) fmLines.push(`${k}: ${v}`);
+      fmLines.push("---", "");
+      writeFileSync(join(dir, "SKILL.md"), `${fmLines.join("\n")}${body}\n`, "utf8");
+    }
 
-  it("passes large max-iters values through unchanged (no upper clamp)", () => {
-    writeSkillDir(
-      home,
-      "global",
-      "bigger",
-      { description: "...", runAs: "subagent", "max-iters": "9999" },
-      "body",
-      home,
-    );
-    const store = new SkillStore({ homeDir: home, disableBuiltins: true });
-    expect(store.read("bigger")?.maxToolIters).toBe(9999);
-  });
+    it("reads skills from ~/.claude/skills/", () => {
+      writeClaudeSkill(home, "global", "from-claude", { description: "lifted from Claude" }, "go");
+      const store = new SkillStore({ homeDir: home, disableBuiltins: true });
+      const skill = store.read("from-claude");
+      expect(skill?.description).toBe("lifted from Claude");
+      expect(skill?.scope).toBe("global");
+    });
 
-  it("ignores max-iters below 1 (falls back to subagent default)", () => {
-    writeSkillDir(
-      home,
-      "global",
-      "toosmall",
-      { description: "...", runAs: "subagent", "max-iters": "0" },
-      "body",
-      home,
-    );
-    const store = new SkillStore({ homeDir: home, disableBuiltins: true });
-    expect(store.read("toosmall")?.maxToolIters).toBeUndefined();
-  });
+    it("reads skills from <project>/.claude/skills/", () => {
+      const project = mkdtempSync(join(tmpdir(), "reasonix-skills-proj-"));
+      try {
+        writeClaudeSkill(project, "project", "proj-skill", { description: "from project" }, "go");
+        const store = new SkillStore({
+          homeDir: home,
+          projectRoot: project,
+          disableBuiltins: true,
+        });
+        const skill = store.read("proj-skill");
+        expect(skill?.description).toBe("from project");
+        expect(skill?.scope).toBe("project");
+      } finally {
+        rmSync(project, { recursive: true, force: true });
+      }
+    });
 
-  it("ignores max-iters that isn't a number", () => {
-    writeSkillDir(
-      home,
-      "global",
-      "junk",
-      { description: "...", runAs: "subagent", "max-iters": "many" },
-      "body",
-      home,
-    );
-    const store = new SkillStore({ homeDir: home, disableBuiltins: true });
-    expect(store.read("junk")?.maxToolIters).toBeUndefined();
+    it("treats `context: fork` as runAs: subagent", () => {
+      writeSkillDir(
+        home,
+        "global",
+        "forked",
+        { description: "...", context: "fork" },
+        "body",
+        home,
+      );
+      const store = new SkillStore({ homeDir: home, disableBuiltins: true });
+      expect(store.read("forked")?.runAs).toBe("subagent");
+    });
+
+    it("treats non-empty `agent:` as runAs: subagent", () => {
+      writeSkillDir(
+        home,
+        "global",
+        "agented",
+        { description: "...", agent: "Explore" },
+        "body",
+        home,
+      );
+      const store = new SkillStore({ homeDir: home, disableBuiltins: true });
+      expect(store.read("agented")?.runAs).toBe("subagent");
+    });
+
+    it("warns to console when description is missing", () => {
+      writeSkillDir(home, "global", "no-desc", { name: "no-desc" }, "body", home);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        new SkillStore({ homeDir: home, disableBuiltins: true }).read("no-desc");
+        expect(warn).toHaveBeenCalledOnce();
+        expect(warn.mock.calls[0]![0]).toMatch(/no description/);
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 });
 
@@ -462,7 +781,7 @@ describe("Built-in skills", () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  it("ships explore/research/review/security-review/test as builtins", () => {
+  it("ships explore/research/review/security-review/test/qq as builtins", () => {
     const store = new SkillStore({ homeDir: home }); // builtins ON
     const names = store.list().map((s) => s.name);
     expect(names).toContain("explore");
@@ -470,6 +789,7 @@ describe("Built-in skills", () => {
     expect(names).toContain("review");
     expect(names).toContain("security-review");
     expect(names).toContain("test");
+    expect(names).toContain("qq");
     const explore = store.read("explore");
     expect(explore?.runAs).toBe("subagent");
     expect(explore?.scope).toBe("builtin");
@@ -490,6 +810,11 @@ describe("Built-in skills", () => {
     expect(test?.runAs).toBe("inline");
     expect(test?.body).toMatch(/run_command/);
     expect(test?.body).toMatch(/SEARCH\/REPLACE/);
+    const qq = store.read("qq");
+    expect(qq?.runAs).toBe("inline");
+    expect(qq?.scope).toBe("builtin");
+    expect(qq?.body).toMatch(/\/qq connect/);
+    expect(qq?.body).toMatch(/QQ Channel/);
   });
 
   it("user-authored skills override a builtin with the same name", () => {
@@ -516,5 +841,7 @@ describe("Built-in skills", () => {
     // /test is inline → no subagent tag
     expect(out).toContain("test —");
     expect(out).not.toContain("test [🧬 subagent]");
+    expect(out).toContain("qq —");
+    expect(out).not.toContain("qq [🧬 subagent]");
   });
 });

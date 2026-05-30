@@ -1,6 +1,6 @@
-/** Bare `reasonix` routing — project-like cwd should launch code mode, explicit `chat` must stay chat. */
+/** Bare `reasonix` routing — defaults to code mode in the current directory; explicit `chat` stays chat. */
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -31,7 +31,11 @@ describe("bare CLI routing", () => {
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "reasonix-cli-home-"));
-    cwd = mkdtempSync(join(tmpdir(), "reasonix-cli-cwd-"));
+    // macOS's tmpdir is /var/folders/... but realpath is /private/var/folders/...;
+    // process.chdir followed by process.cwd() returns the resolved form, so
+    // normalise here too or the toHaveBeenCalledWith({ dir: cwd, ... }) assertions
+    // compare mismatched paths.
+    cwd = realpathSync(mkdtempSync(join(tmpdir(), "reasonix-cli-cwd-")));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
     process.chdir(cwd);
@@ -61,38 +65,50 @@ describe("bare CLI routing", () => {
     }
   });
 
-  it("routes bare reasonix in a .git directory to code mode rooted at cwd", async () => {
+  it("routes bare reasonix to code mode rooted at cwd", async () => {
     writeConfig({ setupCompleted: true }, join(home, ".reasonix", "config.json"));
     mkdirSync(join(cwd, ".git"));
 
     await importCli([]);
 
-    await vi.waitFor(() => expect(codeCommand).toHaveBeenCalledWith({ dir: cwd }));
+    await vi.waitFor(() =>
+      expect(codeCommand).toHaveBeenCalledWith({ dir: cwd, forceResume: false, noMouse: false }),
+    );
     expect(chatCommand).not.toHaveBeenCalled();
   });
 
-  it("routes bare reasonix in a non-project directory to chat mode and prints the filesystem hint", async () => {
+  it("routes bare reasonix in a non-project directory to code mode too", async () => {
     writeConfig({ setupCompleted: true }, join(home, ".reasonix", "config.json"));
 
     await importCli([]);
 
-    await vi.waitFor(() => expect(chatCommand).toHaveBeenCalled());
-    expect(codeCommand).not.toHaveBeenCalled();
-    expect(stderr.mock.calls.map((call) => String(call[0])).join("")).toContain(
-      "chat mode (no filesystem tools). Run `reasonix code` to work on files in this folder.",
+    await vi.waitFor(() =>
+      expect(codeCommand).toHaveBeenCalledWith({ dir: cwd, forceResume: false, noMouse: false }),
+    );
+    expect(chatCommand).not.toHaveBeenCalled();
+    expect(stderr.mock.calls.map((call) => String(call[0])).join("")).not.toContain(
+      "chat mode (no filesystem tools)",
     );
   });
 
-  it("routes bare reasonix in a recent workspace to code mode", async () => {
-    writeConfig(
-      { setupCompleted: true, recentWorkspaces: [cwd] },
-      join(home, ".reasonix", "config.json"),
+  it("forwards -c to code mode as forceResume", async () => {
+    writeConfig({ setupCompleted: true }, join(home, ".reasonix", "config.json"));
+
+    await importCli(["-c"]);
+
+    await vi.waitFor(() =>
+      expect(codeCommand).toHaveBeenCalledWith({ dir: cwd, forceResume: true, noMouse: false }),
     );
+  });
 
-    await importCli([]);
+  it("forwards bare --no-mouse to code mode", async () => {
+    writeConfig({ setupCompleted: true }, join(home, ".reasonix", "config.json"));
 
-    await vi.waitFor(() => expect(codeCommand).toHaveBeenCalledWith({ dir: cwd }));
-    expect(chatCommand).not.toHaveBeenCalled();
+    await importCli(["--no-mouse"]);
+
+    await vi.waitFor(() =>
+      expect(codeCommand).toHaveBeenCalledWith({ dir: cwd, forceResume: false, noMouse: true }),
+    );
   });
 
   it("keeps explicit reasonix chat in chat mode even inside a project", async () => {

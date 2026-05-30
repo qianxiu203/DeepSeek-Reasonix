@@ -1,9 +1,9 @@
-import { mcpEnvFor, readConfig } from "../../config.js";
+import { normalizeMcpConfig, readConfig } from "../../config.js";
 import { McpClient } from "../../mcp/client.js";
 import { inspectMcpServer } from "../../mcp/inspect.js";
 import type { InspectionReport } from "../../mcp/inspect.js";
 import { preflightStdioSpec } from "../../mcp/preflight.js";
-import { parseMcpSpec } from "../../mcp/spec.js";
+import { overlayMatchedSpec, parseMcpSpec } from "../../mcp/spec.js";
 import { buildTransportFromSpec } from "../../mcp/transport-from-spec.js";
 
 export interface McpInspectOptions {
@@ -14,10 +14,19 @@ export interface McpInspectOptions {
 }
 
 export async function mcpInspectCommand(opts: McpInspectOptions): Promise<void> {
-  const spec = parseMcpSpec(opts.spec);
-  if (spec.transport === "stdio") preflightStdioSpec(spec);
-  const transport = buildTransportFromSpec(spec, { env: mcpEnvFor(spec.name, readConfig()) });
-  const client = new McpClient({ transport });
+  const parsed = parseMcpSpec(opts.spec);
+  const cfg = readConfig();
+  const normalized = normalizeMcpConfig(cfg);
+  const matched = parsed.name ? normalized.find((s) => s.name === parsed.name) : undefined;
+  const spec = overlayMatchedSpec(parsed, matched);
+  const workspaceDir = process.cwd();
+  if (spec.transport === "stdio") preflightStdioSpec(spec, { cwd: workspaceDir });
+  const transport = buildTransportFromSpec(spec, { cwd: workspaceDir });
+  const client = new McpClient({
+    transport,
+    workspaceDir,
+    requestTimeoutMs: spec.requestTimeoutMs,
+  });
   try {
     await client.initialize();
     const report = await inspectMcpServer(client);

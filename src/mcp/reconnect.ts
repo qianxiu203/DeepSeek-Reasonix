@@ -18,6 +18,10 @@ export interface ReconnectArgs {
   accept?: ReadonlyArray<"identity" | "append">;
   /** Stdio env overlay — same lookup that produced the live client's env. */
   env?: Record<string, string>;
+  /** SSE / Streamable-HTTP headers overlay. */
+  headers?: Record<string, string>;
+  /** Per-request timeout override in ms. */
+  requestTimeoutMs?: number;
 }
 
 export type ReconnectResult =
@@ -56,8 +60,13 @@ export async function reconnectMcpServer(args: ReconnectArgs): Promise<Reconnect
       ms: Date.now() - t0,
     };
   }
-  const transport = buildTransportFromSpec(parsed, { env: args.env });
-  const next = new McpClient({ transport });
+  const workspaceDir = args.host.client.workspaceRootDir;
+  const transport = buildTransportFromSpec(parsed, {
+    env: args.env,
+    headers: args.headers,
+    cwd: workspaceDir,
+  });
+  const next = new McpClient({ transport, workspaceDir, requestTimeoutMs: args.requestTimeoutMs });
   try {
     await next.initialize();
     const listed = await next.listTools();

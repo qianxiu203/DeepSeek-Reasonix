@@ -1,5 +1,24 @@
+// First import — reject unsupported Node versions before heavier startup
+// paths can turn an engine mismatch into an opaque crash.
+import "./node-version-guard.js";
+
+// Then re-exec with a bigger V8 heap when Node's stock 2 GiB cap is in force
+// (issue #1011). Side-effect on module load, before any heavy import below runs.
+import "./heap-limit-launch.js";
+
+// Wrap stdout/stderr before any third-party lib gets a chance to emit BEL on
+// Windows cmd, which would beep the system bell every render (#1786).
+import "./strip-bel.js";
+
 import { Command } from "commander";
-import { readConfig } from "../config.js";
+import {
+  ensureDashboardToken,
+  isReasoningEffort,
+  loadDashboardEnabled,
+  loadProxyConfig,
+  readConfig,
+  saveReasoningEffort,
+} from "../config.js";
 import { t } from "../i18n/index.js";
 import { VERSION } from "../index.js";
 import { listSessions } from "../memory/session.js";
@@ -16,10 +35,30 @@ async function maybeStartCpuProfile(flag: unknown): Promise<boolean> {
   return true;
 }
 
+function persistEffortFlag(flag: unknown): void {
+  if (typeof flag !== "string") return;
+  const v = flag.toLowerCase();
+  if (!isReasoningEffort(v)) return;
+  try {
+    saveReasoningEffort(v);
+  } catch {
+    /* best-effort */
+  }
+}
+
 // HTTPS_PROXY / HTTP_PROXY only reach Node's fetch via undici's global
 // dispatcher; install before any client (DeepSeek, web tools, dashboard)
-// constructs a fetch closure. Issue #646.
-installProxyIfConfigured();
+// constructs a fetch closure (#646). Argv is peeked manually here — commander
+// hasn't run yet — so position of `--no-proxy` doesn't matter and we can
+// honor it before any fetch closure captures the dispatcher.
+const cliNoProxy = process.argv.includes("--no-proxy");
+const cfgProxy = loadProxyConfig();
+installProxyIfConfigured(process.env, {
+  disabled: cliNoProxy || cfgProxy.disabled === true,
+  url: cfgProxy.url,
+  extraNoProxy: cfgProxy.noProxy,
+  bypassDeepSeekDirect: cfgProxy.bypassDeepSeekDirect,
+});
 
 markPhase("cli_module_loaded");
 
@@ -59,35 +98,6 @@ function parseBudgetFlag(raw: number | undefined): number | undefined {
   return raw;
 }
 
-/** Lenient: malformed → undefined so a bad flag falls back to config / default. */
-function parseEscalateAfterFlag(raw: number | undefined): number | undefined {
-  if (raw === undefined) return undefined;
-  if (!Number.isInteger(raw) || raw < 1 || raw > 20) {
-    process.stderr.write(
-      `▲ ignoring --escalate-after=${raw} (must be an integer in [1,20]) — using default\n`,
-    );
-    return undefined;
-  }
-  return raw;
-}
-
-function resolveFailureThreshold(
-  flagValue: number | undefined,
-  noConfig: boolean,
-): number | undefined {
-  if (flagValue !== undefined) return flagValue;
-  if (noConfig) return undefined;
-  const fromCfg = readConfig().escalation?.failureThreshold;
-  if (typeof fromCfg !== "number") return undefined;
-  if (!Number.isInteger(fromCfg) || fromCfg < 1 || fromCfg > 20) {
-    process.stderr.write(
-      `▲ ignoring escalation.failureThreshold=${fromCfg} from config (must be an integer in [1,20]) — using default\n`,
-    );
-    return undefined;
-  }
-  return fromCfg;
-}
-
 /** Lenient port parser — bad value warns + falls back to ephemeral, same shape as parseBudgetFlag. */
 function parseDashboardPortFlag(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
@@ -114,52 +124,61 @@ function resolveDashboardPort(
     : undefined;
 }
 
+/** Resolution order: flag → REASONIX_DASHBOARD_HOST env → config.dashboard.host → undefined (server defaults to 127.0.0.1). */
+function resolveDashboardHost(
+  flagValue: string | undefined,
+  noConfig: boolean,
+): string | undefined {
+  const fromFlag = flagValue?.trim();
+  if (fromFlag) return fromFlag;
+  const fromEnv = process.env.REASONIX_DASHBOARD_HOST?.trim();
+  if (fromEnv) return fromEnv;
+  if (noConfig) return undefined;
+  const fromCfg = readConfig().dashboard?.host;
+  return typeof fromCfg === "string" && fromCfg.trim() ? fromCfg.trim() : undefined;
+}
+
+/** Resolution order: REASONIX_DASHBOARD_TOKEN env → config.dashboard.token (minted + persisted on first call so the URL survives CLI restarts). Min 16 chars; shorter env overrides are dropped with a warning. */
+function resolveDashboardToken(noConfig: boolean): string | undefined {
+  const fromEnv = process.env.REASONIX_DASHBOARD_TOKEN?.trim();
+  if (fromEnv) {
+    if (fromEnv.length < 16) {
+      process.stderr.write(
+        `▲ ignoring dashboard token (${fromEnv.length} chars; min 16) — using ephemeral per-boot token instead\n`,
+      );
+      return undefined;
+    }
+    return fromEnv;
+  }
+  if (noConfig) return undefined;
+  return ensureDashboardToken();
+}
+
 const program = new Command();
 program
   .name("reasonix")
   .description(t("cli.description"))
   .version(VERSION)
-  .option("-c, --continue", t("cli.continue"));
+  .option("-c, --continue", t("cli.continue"))
+  .option("--no-mouse", t("ui.noMouseHint"))
+  .option("--no-proxy", t("ui.noProxyHint"));
 
-// `reasonix` with no subcommand → launch the friendliest flow.
-// First run (no config yet) → interactive setup wizard.
-// Otherwise → chat with saved defaults. This is the "one command to
-// rule them all" entry for non-power-users: they don't need to learn
-// `chat` / `setup` / `--mcp` — just type `reasonix`.
-program.action(async (opts: { continue?: boolean }) => {
+// `reasonix` with no subcommand → setup wizard on first run, otherwise `code`
+// in the current directory. Filesystem-less chat stays reachable via
+// `reasonix chat`.
+program.action(async (opts: { continue?: boolean; mouse?: boolean }) => {
   const cfg = readConfig();
-  const cwd = process.cwd();
-  const mode = resolveBareCommandMode(cwd, cfg);
+  const mode = resolveBareCommandMode(cfg);
   if (mode === "setup") {
     const { setupCommand } = await import("./commands/setup.js");
     await setupCommand({ forceKeyStep: true });
     return;
   }
-  if (mode === "code") {
-    const { codeCommand } = await import("./commands/code.js");
-    await codeCommand({ dir: cwd });
-    return;
-  }
-  const defaults = resolveDefaults({});
-  const continueOpts = resolveContinueFlag(
-    opts.continue,
-    defaults.session,
-    () => listSessions()[0],
-    (msg) => process.stderr.write(`${msg}\n`),
-  );
-  process.stderr.write(
-    "ℹ chat mode (no filesystem tools). Run `reasonix code` to work on files in this folder.\n",
-  );
-  const { chatCommand } = await import("./commands/chat.js");
-  const defaultBase = defaultSystemPrompt(defaults.model);
-  const defaultRebuildSystem = () => applyMemoryStack(defaultBase, cwd);
-  await chatCommand({
-    model: defaults.model,
-    system: defaultRebuildSystem(),
-    rebuildSystem: defaultRebuildSystem,
-    session: continueOpts.session,
-    mcp: defaults.mcp,
-    forceResume: continueOpts.forceResume,
+  const { codeCommand } = await import("./commands/code.js");
+  await codeCommand({
+    dir: process.cwd(),
+    forceResume: !!opts.continue,
+    noMouse: opts.mouse === false,
   });
 });
 
@@ -175,28 +194,63 @@ program
   .command("code [dir]")
   .description(t("cli.code"))
   .option("-m, --model <id>", t("ui.modelOverride"))
+  .option("--effort <level>", t("ui.effortHintShort"))
   .option("--no-session", t("ui.noSession"))
+  .option("--no-mouse", t("ui.noMouseHint"))
+  .option("--no-proxy", t("ui.noProxyHint"))
   .option("-r, --resume", t("ui.resumeHint"))
   .option("-n, --new", t("ui.newHint"))
   .option("--transcript <path>", t("ui.transcriptHint"))
   .option("--budget <usd>", t("ui.budgetHint"), (v) => Number.parseFloat(v))
-  .option(
-    "--escalate-after <n>",
-    "repair-signal count before flash→pro escalation (default 3)",
-    (v) => Number.parseInt(v, 10),
-  )
   .option("--no-dashboard", t("ui.noDashboard"))
   .option("--open-dashboard", t("ui.openDashboardHint"))
   .option("--dashboard-port <port>", t("ui.dashboardPortHint"))
-  .option("--no-alt-screen", "keep chat output in shell scrollback (legacy mode, ghost-prone)")
-  .option("--no-mouse", "disable SGR mouse tracking (keeps drag-select 100% native)")
+  .option(
+    "--dashboard-host <host>",
+    "bind address for the dashboard (default 127.0.0.1; use 0.0.0.0 for LAN access — the URL token is then the only auth)",
+  )
   .option("--system-append <prompt>", t("ui.systemAppendHint"))
   .option("--system-append-file <path>", t("ui.systemAppendFileHint"))
+  .option(
+    "--dry-run",
+    "for ssh:// targets: parse the URI, check local SSH, print planned steps (no remote commands execute). RFC for #2140.",
+  )
   .option(
     "--profile [path]",
     "record a V8 CPU profile; saved on exit. Send the .cpuprofile back if you're reporting a perf bug.",
   )
   .action(async (dir: string | undefined, opts) => {
+    // ssh:// without --dry-run is not yet implemented (RFC #2140).
+    if (typeof dir === "string" && dir.startsWith("ssh://") && !opts.dryRun) {
+      process.stderr.write(
+        "ssh:// remote workspaces require --dry-run (RFC #2140).\n" +
+          "Full remote execution is not yet implemented.\n" +
+          "\n" +
+          "Short-term recommendation:\n" +
+          "  Run Reasonix directly on the remote host, then use SSH tunnel for the dashboard:\n" +
+          "  $ ssh -L 8420:127.0.0.1:8420 user@host\n" +
+          "  $ reasonix code\n",
+      );
+      process.exit(1);
+    }
+
+    // SSH remote workspace RFC — dry-run bootstrap for #2140.
+    if (typeof dir === "string" && dir.startsWith("ssh://") && opts.dryRun) {
+      const { generateSshDryRunReport, parseSshUri, probeSsh } = await import("./ssh-remote.js");
+      const uri = parseSshUri(dir);
+      if (!uri) {
+        process.stderr.write(`invalid ssh:// URI: ${dir}\n`);
+        process.stderr.write("expected format: ssh://[user@]host[:port][/path]\n");
+        process.exit(1);
+      }
+      const ssh = probeSsh();
+      const report = generateSshDryRunReport(uri, ssh);
+      console.log(report);
+      if (!ssh) process.exit(1);
+      return;
+    }
+
+    persistEffortFlag(opts.effort);
     const profiling = await maybeStartCpuProfile(opts.profile);
     try {
       const { codeCommand } = await import("./commands/code.js");
@@ -208,17 +262,14 @@ program
         forceResume: !!opts.resume,
         forceNew: !!opts.new,
         budgetUsd: parseBudgetFlag(opts.budget),
-        failureThreshold: resolveFailureThreshold(
-          parseEscalateAfterFlag(opts.escalateAfter),
-          false,
-        ),
-        noDashboard: opts.dashboard === false,
+        noDashboard: opts.dashboard === false || !loadDashboardEnabled(false),
         openDashboard: opts.openDashboard === true,
         dashboardPort: resolveDashboardPort(parseDashboardPortFlag(opts.dashboardPort), false),
+        dashboardHost: resolveDashboardHost(opts.dashboardHost, false),
+        dashboardToken: resolveDashboardToken(false),
+        noMouse: opts.mouse === false,
         systemAppend: opts.systemAppend,
         systemAppendFile: opts.systemAppendFile,
-        altScreen: opts.altScreen !== false,
-        mouse: opts.mouse !== false,
       });
     } finally {
       if (profiling) await stopAndSaveCpuProfile();
@@ -231,15 +282,12 @@ program
   .option("-m, --model <id>", t("ui.modelIdHint"))
   .option("-s, --system <prompt>", t("ui.systemPromptHint"))
   .option("--transcript <path>", t("ui.transcriptHint"))
-  .option("--preset <name>", t("ui.presetHint"))
+  .option("--effort <level>", t("ui.effortHint"))
   .option("--budget <usd>", t("ui.budgetHint"), (v) => Number.parseFloat(v))
-  .option(
-    "--escalate-after <n>",
-    "repair-signal count before flash→pro escalation (default 3)",
-    (v) => Number.parseInt(v, 10),
-  )
   .option("--session <name>", t("ui.sessionNameHint"))
   .option("--no-session", t("ui.ephemeralHint"))
+  .option("--no-mouse", t("ui.noMouseHint"))
+  .option("--no-proxy", t("ui.noProxyHint"))
   .option("-r, --resume", t("ui.resumeHint"))
   .option("-c, --continue", t("cli.continue"))
   .option("-n, --new", t("ui.newHint"))
@@ -254,8 +302,10 @@ program
   .option("--no-dashboard", t("ui.noDashboard"))
   .option("--open-dashboard", t("ui.openDashboardHint"))
   .option("--dashboard-port <port>", t("ui.dashboardPortHint"))
-  .option("--no-alt-screen", "keep chat output in shell scrollback (legacy mode, ghost-prone)")
-  .option("--no-mouse", "disable SGR mouse tracking (keeps drag-select 100% native)")
+  .option(
+    "--dashboard-host <host>",
+    "bind address for the dashboard (default 127.0.0.1; use 0.0.0.0 for LAN access — the URL token is then the only auth)",
+  )
   .option(
     "--profile [path]",
     "record a V8 CPU profile; saved on exit. Send the .cpuprofile back if you're reporting a perf bug.",
@@ -263,11 +313,12 @@ program
   .action(async (opts) => {
     const profiling = await maybeStartCpuProfile(opts.profile);
     try {
+      persistEffortFlag(opts.effort);
       const defaults = resolveDefaults({
         model: opts.model,
         mcp: opts.mcp as string[],
         session: opts.session,
-        preset: opts.preset,
+        effort: opts.effort,
         noConfig: opts.config === false,
       });
       // `-c` is "newest-touched session" + auto-resume; `-r` is "this
@@ -288,27 +339,25 @@ program
       const chatRebuildSystem = () => applyMemoryStack(chatBase, chatCwd);
       await chatCommand({
         model: defaults.model,
+        reasoningEffort: defaults.reasoningEffort,
         system: chatRebuildSystem(),
         rebuildSystem: chatRebuildSystem,
         transcript: opts.transcript,
         budgetUsd: parseBudgetFlag(opts.budget),
-        failureThreshold: resolveFailureThreshold(
-          parseEscalateAfterFlag(opts.escalateAfter),
-          opts.config === false,
-        ),
         session: continueOpts.session,
         mcp: defaults.mcp,
         mcpPrefix: opts.mcpPrefix,
         forceResume: continueOpts.forceResume,
-        forceNew: !!opts.new,
-        noDashboard: opts.dashboard === false,
+        forceNew: !!opts.new || !!defaults.forceNew,
+        noDashboard: opts.dashboard === false || !loadDashboardEnabled(opts.config === false),
         openDashboard: opts.openDashboard === true,
         dashboardPort: resolveDashboardPort(
           parseDashboardPortFlag(opts.dashboardPort),
           opts.config === false,
         ),
-        altScreen: opts.altScreen !== false,
-        mouse: opts.mouse !== false,
+        dashboardHost: resolveDashboardHost(opts.dashboardHost, opts.config === false),
+        dashboardToken: resolveDashboardToken(opts.config === false),
+        noMouse: opts.mouse === false,
       });
     } finally {
       if (profiling) await stopAndSaveCpuProfile();
@@ -320,13 +369,8 @@ program
   .description(t("cli.run"))
   .option("-m, --model <id>", t("ui.modelIdHint"))
   .option("-s, --system <prompt>", t("ui.systemPromptHint"))
-  .option("--preset <name>", t("ui.presetHintShort"))
+  .option("--effort <level>", t("ui.effortHintShort"))
   .option("--budget <usd>", t("ui.budgetHintShort"), (v) => Number.parseFloat(v))
-  .option(
-    "--escalate-after <n>",
-    "repair-signal count before flash→pro escalation (default 3)",
-    (v) => Number.parseInt(v, 10),
-  )
   .option("--transcript <path>", t("ui.transcriptHintShort"))
   .option(
     "--mcp <spec>",
@@ -336,11 +380,13 @@ program
   )
   .option("--mcp-prefix <str>", t("ui.mcpPrefixHintShort"))
   .option("--no-config", t("ui.noConfigHint"))
+  .option("--no-proxy", t("ui.noProxyHint"))
   .action(async (task: string, opts) => {
+    persistEffortFlag(opts.effort);
     const defaults = resolveDefaults({
       model: opts.model,
       mcp: opts.mcp as string[],
-      preset: opts.preset,
+      effort: opts.effort,
       noConfig: opts.config === false,
     });
     const { runCommand } = await import("./commands/run.js");
@@ -349,10 +395,6 @@ program
       model: defaults.model,
       system: applyMemoryStack(opts.system ?? defaultSystemPrompt(defaults.model), process.cwd()),
       budgetUsd: parseBudgetFlag(opts.budget),
-      failureThreshold: resolveFailureThreshold(
-        parseEscalateAfterFlag(opts.escalateAfter),
-        opts.config === false,
-      ),
       transcript: opts.transcript,
       mcp: defaults.mcp,
       mcpPrefix: opts.mcpPrefix,
@@ -364,7 +406,7 @@ program
   .description("run reasonix as an Agent Client Protocol (ACP) agent on stdio NDJSON JSON-RPC")
   .option("-m, --model <id>", t("ui.modelIdHint"))
   .option("--dir <path>", "root directory for filesystem tools (default: cwd)")
-  .option("--preset <name>", t("ui.presetHintShort"))
+  .option("--effort <level>", t("ui.effortHintShort"))
   .option("--budget <usd>", t("ui.budgetHintShort"), (v) => Number.parseFloat(v))
   .option("--transcript <path>", t("ui.transcriptHint"))
   .option("--yolo", t("ui.yoloHint"))
@@ -376,10 +418,11 @@ program
   )
   .option("--mcp-prefix <str>", t("ui.mcpPrefixHintShort"))
   .action(async (opts) => {
+    persistEffortFlag(opts.effort);
     const defaults = resolveDefaults({
       model: opts.model,
       mcp: opts.mcp as string[],
-      preset: opts.preset,
+      effort: opts.effort,
       noConfig: false,
     });
     const { acpCommand } = await import("./commands/acp.js");
@@ -399,13 +442,14 @@ program
   .description("headless JSON-RPC chat for the desktop client (internal)")
   .option("-m, --model <id>", t("ui.modelIdHint"))
   .option("--dir <path>", "root directory for filesystem tools (default: cwd)")
-  .option("--preset <name>", t("ui.presetHintShort"))
+  .option("--effort <level>", t("ui.effortHintShort"))
   .option("--budget <usd>", t("ui.budgetHintShort"), (v) => Number.parseFloat(v))
   .action(async (opts) => {
+    persistEffortFlag(opts.effort);
     const defaults = resolveDefaults({
       model: opts.model,
       mcp: [],
-      preset: opts.preset,
+      effort: opts.effort,
       noConfig: false,
     });
     const { desktopCommand } = await import("./commands/desktop.js");
@@ -428,9 +472,19 @@ program
   .command("doctor")
   .description(t("cli.doctor"))
   .option("--json", t("ui.jsonHint"))
+  .option("--cache", "run cache-stability checks only")
   .action(async (opts) => {
     const { doctorCommand } = await import("./commands/doctor.js");
-    await doctorCommand({ json: !!opts.json });
+    await doctorCommand({ json: !!opts.json, cache: !!opts.cache });
+  });
+
+program
+  .command("doctor-cache")
+  .description("cache-stability health check")
+  .option("--json", t("ui.jsonHint"))
+  .action(async (opts) => {
+    const { doctorCommand } = await import("./commands/doctor.js");
+    await doctorCommand({ json: !!opts.json, cache: true });
   });
 
 program

@@ -1,7 +1,9 @@
+import type { EngineeringLifecycleSnapshot } from "../../../code/lifecycle.js";
 import type { EditMode } from "../../../config.js";
 import type { McpServerSummary } from "../../../mcp/summary.js";
 import type { JobRegistry } from "../../../tools/jobs.js";
 import type { PlanStep } from "../../../tools/plan.js";
+import type { CodeUndoOutput } from "../undo-context.js";
 
 export type { McpServerSummary } from "../../../mcp/summary.js";
 
@@ -10,6 +12,8 @@ export interface SlashResult {
   info?: string;
   /** Open the SessionPicker modal mid-chat — used by `/sessions` slash. */
   openSessionsPicker?: boolean;
+  /** Open the WorkspacePicker modal mid-chat — bare `/cwd` in code mode. */
+  openWorkspacePicker?: boolean;
   /** Open the CheckpointPicker modal — bare `/restore` (no name argument). */
   openCheckpointPicker?: boolean;
   /** Open the ModelPicker modal — bare `/model` (no id) opens it. */
@@ -18,8 +22,6 @@ export interface SlashResult {
   openThemePicker?: boolean;
   /** Open the unified MCP hub — `/mcp` defaults to "live", `/mcp browse` to "marketplace". */
   openMcpHub?: { tab: "live" | "marketplace" };
-  /** Open the vim/tmux-style copy mode — yank chat text to clipboard via OSC 52. */
-  openCopyMode?: boolean;
   /** Open the arg-completer picker for this command (e.g. `/language` → language picker). */
   openArgPickerFor?: string;
   /** Exit the app. */
@@ -57,14 +59,18 @@ export interface SlashResult {
   };
 }
 
+export type PlanModeToggleSource = "slash" | "explicit-intent";
+
 export interface SlashContext {
+  configPath?: string;
   mcpSpecs?: string[];
-  codeUndo?: (args: readonly string[]) => string;
+  codeUndo?: (args: readonly string[]) => CodeUndoOutput;
   codeApply?: (indices?: readonly number[]) => string;
   codeDiscard?: (indices?: readonly number[]) => string;
   codeHistory?: () => string;
   codeShowEdit?: (args: readonly string[]) => string;
   codeRoot?: string;
+  getEngineeringLifecycleSnapshot?: () => EngineeringLifecycleSnapshot | null;
   pendingEditCount?: number;
   mcpServers?: McpServerSummary[];
   /** Absent → tests context; `/memory` MUST reply "root unknown" rather than silently reading wrong dir. */
@@ -106,7 +112,7 @@ export interface SlashContext {
     footer?: string;
   }) => void;
   dispatch?: (event: import("../state/events.js").AgentEvent) => void;
-  setPlanMode?: (on: boolean) => void;
+  setPlanMode?: (on: boolean, source?: PlanModeToggleSource) => void;
   /** Manual escape valve when the model forgot to call `mark_step_complete` — used by `/plans done <id>`. */
   markPlanStepDone?: (stepId: string) => "ok" | "not-in-plan" | "already-done" | "no-plan";
   /** Mark every still-queued step done — used by `/plans done all`. Returns the count newly marked. */
@@ -128,8 +134,8 @@ export interface SlashContext {
   /** `null` → in flight / failed; `[]` → API answered empty. `/model <id>` warn-only since list can lag. */
   models?: string[] | null;
   refreshModels?: () => void;
-  armPro?: () => void;
-  disarmPro?: () => void;
+  /** Ask the current model to summarize the active session into a short title and rename it. */
+  generateSessionTitle?: () => Promise<string>;
   startLoop?: (intervalMs: number, prompt: string) => void;
   stopLoop?: () => void;
   getLoopStatus?: () => {
@@ -144,6 +150,21 @@ export interface SlashContext {
   stopDashboard?: () => Promise<void>;
   /** Snapshot the dashboard's URL when running, null otherwise. */
   getDashboardUrl?: () => string | null;
+  qq?: {
+    connect: (args: readonly string[]) => Promise<string>;
+    disconnect: () => Promise<string>;
+    status: () => string;
+  };
+  telegram?: {
+    connect: (args: readonly string[]) => Promise<string>;
+    disconnect: () => Promise<string>;
+    status: () => string;
+  };
+  weixin?: {
+    connect: (args: readonly string[]) => Promise<string>;
+    disconnect: () => Promise<string>;
+    status: () => string;
+  };
   /** Current session id — included in `/feedback`'s diagnostic block when present. */
   sessionId?: string;
 }
@@ -166,8 +187,8 @@ export interface SlashCommandSpec {
   group: SlashGroup;
   /** If the command takes args, hint text shown after the name. */
   argsHint?: string;
-  /** First-arg picker source — file paths intentionally absent (use `@path` mentions instead). */
-  argCompleter?: "models" | "mcp-resources" | "mcp-prompts" | "skills" | readonly string[];
+  /** First-arg picker source. `"path"` async-lists the filesystem for directory completion (used by `/cwd`). */
+  argCompleter?: "models" | "mcp-resources" | "mcp-prompts" | "skills" | "path" | readonly string[];
   /** Alternate names — typing any of these resolves to `cmd` for dispatch / suggestion / arg-context. */
   aliases?: readonly string[];
 }

@@ -11,7 +11,12 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { type ReasonixConfig, memoryTypeDefaults } from "../config.js";
+import {
+  type ReasonixConfig,
+  loadResolvedSkillPaths,
+  memoryTypeDefaults,
+  resolveSkillPaths,
+} from "../config.js";
 import { parseFrontmatter } from "../frontmatter.js";
 import { applySkillsIndex } from "../skills.js";
 import { applyProjectMemory, memoryEnabled } from "./project.js";
@@ -343,6 +348,46 @@ export function applyGlobalReasonixMemory(basePrompt: string, homeDir?: string):
   ].join("\n");
 }
 
+/** Read ~/.claude/CLAUDE.md — cross-project notes from Claude Code migration.
+ *  Same cap as global Reasonix memory (8000 chars). */
+export function readGlobalClaudeMemory(
+  homeDir: string = homedir(),
+): { path: string; content: string; originalChars: number; truncated: boolean } | null {
+  const path = join(homeDir, ".claude", "CLAUDE.md");
+  if (!existsSync(path)) return null;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const originalChars = trimmed.length;
+  const truncated = originalChars > 8000;
+  const content = truncated
+    ? `${trimmed.slice(0, 8000)}\n… (truncated ${originalChars - 8000} chars)`
+    : trimmed;
+  return { path, content, originalChars, truncated };
+}
+
+export function applyGlobalClaudeMemory(basePrompt: string): string {
+  if (!memoryEnabled()) return basePrompt;
+  const mem = readGlobalClaudeMemory();
+  if (!mem) return basePrompt;
+  return [
+    basePrompt,
+    "",
+    "# Global memory (~/.claude/CLAUDE.md)",
+    "",
+    "Cross-project notes from your Claude Code configuration. Treat as authoritative — same level of trust as project memory.",
+    "",
+    "```",
+    mem.content,
+    "```",
+  ].join("\n");
+}
+
 /** Effective priority: entry's own field wins, else the config default for its type, else undefined. */
 export function effectivePriority(
   entry: MemoryEntry,
@@ -413,16 +458,19 @@ export function applyUserMemory(
 export function applyMemoryStack(
   basePrompt: string,
   rootDir: string,
-  opts: { homeDir?: string } = {},
+  opts: { homeDir?: string; cfg?: ReasonixConfig } = {},
 ): string {
+  const homeDir = opts.homeDir;
+  const cfg = opts.cfg;
   const withProject = applyProjectMemory(basePrompt, rootDir);
   const withGlobal = applyGlobalReasonixMemory(
     withProject,
-    opts.homeDir ? join(opts.homeDir, ".reasonix") : undefined,
+    homeDir ? join(homeDir, ".reasonix") : undefined,
   );
-  const withMemory = applyUserMemory(withGlobal, {
-    projectRoot: rootDir,
-    homeDir: opts.homeDir,
-  });
-  return applySkillsIndex(withMemory, { projectRoot: rootDir, homeDir: opts.homeDir });
+  const withGlobalClaude = applyGlobalClaudeMemory(withGlobal);
+  const withMemory = applyUserMemory(withGlobalClaude, { projectRoot: rootDir, homeDir, cfg });
+  const customSkillPaths = cfg?.skills?.paths
+    ? resolveSkillPaths(cfg.skills.paths, rootDir)
+    : loadResolvedSkillPaths(rootDir);
+  return applySkillsIndex(withMemory, { projectRoot: rootDir, homeDir, customSkillPaths });
 }

@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { Usage } from "../src/client.js";
+import { writeConfig } from "../src/config.js";
 import {
   DEEPSEEK_PRICING,
   SessionStats,
@@ -23,9 +27,45 @@ describe("Usage.cacheHitRatio", () => {
   it("is zero on empty", () => {
     expect(new Usage().cacheHitRatio).toBe(0);
   });
+
+  it("falls back cache miss tokens from prompt minus cache hit when the API omits miss", () => {
+    const u = Usage.fromApi({
+      prompt_tokens: 1000,
+      completion_tokens: 100,
+      total_tokens: 1100,
+      prompt_cache_hit_tokens: 800,
+    });
+    expect(u.promptCacheHitTokens).toBe(800);
+    expect(u.promptCacheMissTokens).toBe(200);
+  });
+
+  it("maps Ollama native usage fields into prompt and completion tokens", () => {
+    const u = Usage.fromApi({
+      prompt_eval_count: 1234,
+      eval_count: 56,
+    });
+    expect(u.promptTokens).toBe(1234);
+    expect(u.completionTokens).toBe(56);
+    expect(u.totalTokens).toBe(1290);
+    expect(u.promptCacheHitTokens).toBe(0);
+    expect(u.promptCacheMissTokens).toBe(1234);
+  });
 });
 
 describe("costUsd", () => {
+  it("matches DeepSeek's published V4 USD pricing sheet", () => {
+    expect(DEEPSEEK_PRICING["deepseek-v4-flash"]).toEqual({
+      inputCacheHit: 0.0028,
+      inputCacheMiss: 0.14,
+      output: 0.28,
+    });
+    expect(DEEPSEEK_PRICING["deepseek-v4-pro"]).toEqual({
+      inputCacheHit: 0.003625,
+      inputCacheMiss: 0.435,
+      output: 0.87,
+    });
+  });
+
   it("applies DeepSeek pricing tiers", () => {
     const u = new Usage(1000, 100, 0, 800, 200);
     const c = costUsd("deepseek-chat", u);
@@ -37,6 +77,52 @@ describe("costUsd", () => {
 
   it("returns 0 for unknown model", () => {
     expect(costUsd("unknown-model", new Usage(1000, 100))).toBe(0);
+  });
+
+  it("uses pricingOverride for renamed third-party models", () => {
+    const dir = mkdtempSync(join(tmpdir(), "reasonix-telemetry-"));
+    const path = join(dir, "config.json");
+    try {
+      writeConfig(
+        {
+          pricingOverride: {
+            "openrouter/deepseek": { inputCacheHit: 0.5, inputCacheMiss: 2, output: 4 },
+          },
+        },
+        path,
+      );
+      expect(costUsd("openrouter/deepseek", new Usage(1000, 100, 0, 800, 200), path)).toBeCloseTo(
+        (800 * 0.5 + 200 * 2 + 100 * 4) / 1_000_000,
+        10,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns 0 for incomplete unknown-model pricingOverride", () => {
+    const dir = mkdtempSync(join(tmpdir(), "reasonix-telemetry-"));
+    const path = join(dir, "config.json");
+    try {
+      writeConfig({ pricingOverride: { partial: { output: 4 } } }, path);
+      expect(costUsd("partial", new Usage(1000, 100, 0, 800, 200), path)).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets pricingOverride partially override known model pricing", () => {
+    const dir = mkdtempSync(join(tmpdir(), "reasonix-telemetry-"));
+    const path = join(dir, "config.json");
+    try {
+      writeConfig({ pricingOverride: { "deepseek-chat": { output: 9 } } }, path);
+      expect(costUsd("deepseek-chat", new Usage(1000, 100, 0, 800, 200), path)).toBeCloseTo(
+        (800 * CHAT.inputCacheHit + 200 * CHAT.inputCacheMiss + 100 * 9) / 1_000_000,
+        10,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -82,6 +168,28 @@ describe("SessionStats", () => {
     // Sum of input+output equals total (within rounding).
     expect(s.totalInputCostUsd + s.totalOutputCostUsd).toBeCloseTo(s.totalCostUsd, 6);
   });
+
+  it("reset clears live and carryover totals for /new", () => {
+    const stats = new SessionStats();
+    stats.seedCarryover({
+      totalCostUsd: 0.05,
+      turnCount: 3,
+      cacheHitTokens: 1000,
+      cacheMissTokens: 100,
+      lastPromptTokens: 1100,
+    });
+    stats.record(4, "deepseek-chat", new Usage(1000, 100, 1100, 800, 200));
+    stats.reset();
+    expect(stats.turns).toHaveLength(0);
+    expect(stats.totalCost).toBe(0);
+    expect(stats.summary()).toMatchObject({
+      turns: 0,
+      totalCostUsd: 0,
+      cacheHitRatio: 0,
+      lastPromptTokens: 0,
+      lastTurnCostUsd: 0,
+    });
+  });
 });
 
 describe("inputCostUsd / outputCostUsd", () => {
@@ -124,7 +232,7 @@ describe("inputCostUsd / outputCostUsd", () => {
     const u = new Usage(0, 100, 0, 0, 1000);
     const flashCost = costUsd("deepseek-v4-flash", u);
     const proCost = costUsd("deepseek-v4-pro", u);
-    expect(proCost).toBeGreaterThan(flashCost * 5); // ~12x on output+miss
+    expect(proCost).toBeGreaterThan(flashCost * 3); // current pro promo is ~3.1x flash
   });
 
   it("both return 0 for an unknown model", () => {
@@ -226,5 +334,80 @@ describe("SessionStats — issue #364 resume cache + context carryover", () => {
     s.seedCarryover({ cacheHitTokens: 0, cacheMissTokens: -5, lastPromptTokens: 0 });
     expect(s.aggregateCacheHitRatio).toBe(0);
     expect(s.summary().lastPromptTokens).toBe(0);
+  });
+
+  it("cumulativeCompletionTokens sums carryover + live turns so resume doesn't reset the counter", () => {
+    // Regression: #1667 persisted totalCompletionTokens but didn't seed it
+    // back into stats on resume, so the first patchSessionMeta after a
+    // restart overwrote the saved value with just the new turn's tally.
+    const s = new SessionStats();
+    s.seedCarryover({ totalCompletionTokens: 50_000 });
+    expect(s.cumulativeCompletionTokens).toBe(50_000);
+    s.record(1, "deepseek-chat", new Usage(2000, 500, 0, 0, 2000));
+    expect(s.cumulativeCompletionTokens).toBe(50_500);
+  });
+
+  it("seedCarryover ignores zero / negative totalCompletionTokens", () => {
+    const s = new SessionStats();
+    s.seedCarryover({ totalCompletionTokens: 0 });
+    expect(s.cumulativeCompletionTokens).toBe(0);
+    s.seedCarryover({ totalCompletionTokens: -1 });
+    expect(s.cumulativeCompletionTokens).toBe(0);
+  });
+});
+
+describe("SessionStats.recordExternal (#2008)", () => {
+  it("adds subagent cost to session totalCost without creating a turn entry", () => {
+    const s = new SessionStats();
+    s.record(1, "deepseek-v4-pro", new Usage(10_000, 1000, 0, 8000, 2000));
+    const costBefore = s.totalCost;
+    const turnsBefore = s.summary().turns;
+
+    // Simulate a subagent on flash
+    s.recordExternal("deepseek-v4-flash", new Usage(5000, 500, 0, 4000, 1000));
+
+    expect(s.totalCost).toBeGreaterThan(costBefore);
+    // Turn count must NOT increase — subagent is not a parent turn.
+    expect(s.summary().turns).toBe(turnsBefore);
+  });
+
+  it("adds subagent cache tokens to cumulativeToken getters", () => {
+    const s = new SessionStats();
+    s.record(1, "deepseek-v4-pro", new Usage(10_000, 1000, 0, 8000, 2000));
+    const hitBefore = s.cumulativeCacheHitTokens;
+    const missBefore = s.cumulativeCacheMissTokens;
+    const compBefore = s.cumulativeCompletionTokens;
+
+    s.recordExternal("deepseek-v4-flash", new Usage(5000, 500, 0, 4000, 1000));
+
+    expect(s.cumulativeCacheHitTokens).toBe(hitBefore + 4000);
+    expect(s.cumulativeCacheMissTokens).toBe(missBefore + 1000);
+    expect(s.cumulativeCompletionTokens).toBe(compBefore + 500);
+  });
+
+  it("aggregateCacheHitRatio includes subagent tokens", () => {
+    const s = new SessionStats();
+    // Parent: 8000 hit, 2000 miss → 0.8
+    s.record(1, "deepseek-v4-pro", new Usage(10_000, 1000, 0, 8000, 2000));
+    const ratioBefore = s.aggregateCacheHitRatio;
+    expect(ratioBefore).toBeCloseTo(0.8, 4);
+
+    // Subagent: 1000 hit, 4000 miss → 0.2 (lower hit ratio)
+    s.recordExternal("deepseek-v4-flash", new Usage(5000, 500, 0, 1000, 4000));
+
+    // Combined: 9000 hit, 6000 miss → 0.6
+    expect(s.aggregateCacheHitRatio).toBeCloseTo(9000 / 15000, 4);
+    expect(s.aggregateCacheHitRatio).toBeLessThan(ratioBefore);
+  });
+
+  it("summary().totalCostUsd reflects subagent usage", () => {
+    const s = new SessionStats();
+    s.record(1, "deepseek-v4-pro", new Usage(10_000, 1000, 0, 8000, 2000));
+    const summaryBefore = s.summary().totalCostUsd;
+
+    s.recordExternal("deepseek-v4-flash", new Usage(5000, 500, 0, 4000, 1000));
+    const summaryAfter = s.summary().totalCostUsd;
+
+    expect(summaryAfter).toBeGreaterThan(summaryBefore);
   });
 });
